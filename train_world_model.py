@@ -79,8 +79,6 @@ if __name__ == "__main__":
 
     print("Starting training...")
 
-    print("Starting training...")
-
     for epoch in range(50):
 
         model.train()
