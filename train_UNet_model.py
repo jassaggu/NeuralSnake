@@ -4,39 +4,42 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
-
-# Residual Block
+# -------------------------
+# Residual Block (GroupNorm)
+# -------------------------
 class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
+        self.gn1 = nn.GroupNorm(8, channels)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
+        self.gn2 = nn.GroupNorm(8, channels)
 
     def forward(self, x):
         identity = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = F.relu(out + identity)
-        return out
+        out = F.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
+        return F.relu(out + identity)
 
 
-# Downsample Block
+# -------------------------
+# Downsample (single level)
+# -------------------------
 class DownBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, 3, stride=2, padding=1)
-        self.bn = nn.BatchNorm2d(out_ch)
+        self.gn = nn.GroupNorm(8, out_ch)
         self.res = ResBlock(out_ch)
 
     def forward(self, x):
-        x = F.relu(self.bn(self.conv(x)))
-        x = self.res(x)
-        return x
+        x = F.relu(self.gn(self.conv(x)))
+        return self.res(x)
 
 
-# Upsample Block
+# -------------------------
+# Upsample
+# -------------------------
 class UpBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -45,129 +48,103 @@ class UpBlock(nn.Module):
 
     def forward(self, x, skip):
         x = self.up(x)
-
-        # FIX: match spatial size exactly
         if x.shape[-2:] != skip.shape[-2:]:
             x = F.interpolate(x, size=skip.shape[-2:], mode="nearest")
-
         x = x + skip
-        x = self.res(x)
-        return x
+        return self.res(x)
 
 
-# FiLM Conditioning
+# -------------------------
+# FiLM
+# -------------------------
 class FiLM(nn.Module):
     def __init__(self, num_actions, channels):
         super().__init__()
         self.embedding = nn.Embedding(num_actions, channels * 2)
 
     def forward(self, x, action):
-        # x shape: (B, C, H, W)
-        gamma_beta = self.embedding(action)  # (B, 2C)
+        gamma_beta = self.embedding(action)
         gamma, beta = gamma_beta.chunk(2, dim=1)
-
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)
         beta = beta.unsqueeze(-1).unsqueeze(-1)
-
         return gamma * x + beta
 
 
-# Full Model
+# -------------------------
+# World Model
+# -------------------------
 class ResidualUNetWorldModel(nn.Module):
     def __init__(self, num_actions=4):
         super().__init__()
 
-        # Initial
         self.input_conv = nn.Conv2d(3, 32, 3, padding=1)
         self.res1 = ResBlock(32)
 
-        # Encoder
         self.down1 = DownBlock(32, 64)
-        self.down2 = DownBlock(64, 128)
 
-        # FiLM at bottleneck
-        self.film = FiLM(num_actions, 128)
+        self.film = FiLM(num_actions, 64)
 
-        # Decoder
-        self.up1 = UpBlock(128, 64)
-        self.up2 = UpBlock(64, 32)
+        self.up1 = UpBlock(64, 32)
 
-        # Output heads
-        self.head_out = nn.Conv2d(32, 1, 1)  # logits for head
-        self.body_out = nn.Conv2d(32, 1, 1)  # logits for body
-        self.food_out = nn.Conv2d(32, 1, 1)  # logits for food
+        self.head_out = nn.Conv2d(32, 1, 1)
+        self.body_out = nn.Conv2d(32, 1, 1)
+        self.food_out = nn.Conv2d(32, 1, 1)
 
     def forward(self, state, action):
-        # state: (B,3,H,W)
-        # action: (B)
-
         x1 = F.relu(self.input_conv(state))
         x1 = self.res1(x1)
-
         x2 = self.down1(x1)
-        x3 = self.down2(x2)
-
-        # FiLM conditioning
-        x3 = self.film(x3, action)
-
-        # Decode with skip connections
-        x = self.up1(x3, x2)
-        x = self.up2(x, x1)
-
-        # Output heads (logits)
+        x2 = self.film(x2, action)
+        x = self.up1(x2, x1)
         head_logits = self.head_out(x)
         body_logits = self.body_out(x)
         food_logits = self.food_out(x)
-
         return head_logits, body_logits, food_logits
 
 
-if __name__ == "__main__":
-    # Train
-    print("Starting training...")
+# -------------------------
+# Dataset
+# -------------------------
+class SnakeDataset(Dataset):
+    def __init__(self, path):
+        data = np.load(path)
+        self.states = data["states"]
+        self.actions = data["actions"]
+        self.next_states = data["next_states"]
 
-    # Config
+    def __len__(self):
+        return len(self.states)
+
+    def __getitem__(self, idx):
+        state = torch.tensor(self.states[idx], dtype=torch.float32)
+        next_state = torch.tensor(self.next_states[idx], dtype=torch.float32)
+        action = torch.tensor(self.actions[idx], dtype=torch.long)
+        state = state.permute(2, 0, 1)
+        next_state = next_state.permute(2, 0, 1)
+        return state, action, next_state
+
+
+# -------------------------
+# Training
+# -------------------------
+if __name__ == "__main__":
+    DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     BATCH_SIZE = 64
     EPOCHS = 20
     LR = 1e-3
-    DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     DATA_PATH = "snake_transitions.npz"
-
-    print("Using device ", DEVICE)
-
-
-    class SnakeDataset(Dataset):
-        def __init__(self, path):
-            data = np.load(path)
-
-            self.states = data["states"]  # (N,H,W,3)
-            self.actions = data["actions"]  # (N,)
-            self.next_states = data["next_states"]  # (N,H,W,3)
-
-        def __len__(self):
-            return len(self.states)
-
-        def __getitem__(self, idx):
-            state = torch.tensor(self.states[idx], dtype=torch.float32)
-            next_state = torch.tensor(self.next_states[idx], dtype=torch.float32)
-            action = torch.tensor(self.actions[idx], dtype=torch.long)
-
-            # Convert to (C,H,W)
-            state = state.permute(2, 0, 1)
-            next_state = next_state.permute(2, 0, 1)
-
-            return state, action, next_state
-
 
     dataset = SnakeDataset(DATA_PATH)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    model = ResidualUNetWorldModel(num_actions=4).to(DEVICE)
+    model = ResidualUNetWorldModel().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-    for epoch in range(EPOCHS):
+    pos_weight_body = torch.tensor([5.0]).to(DEVICE)  # weight for sparse body
 
+    for epoch in range(EPOCHS):
         total_loss = 0
+        model.train()
 
         for states, actions, next_states in loader:
             states = states.to(DEVICE)
@@ -175,44 +152,45 @@ if __name__ == "__main__":
             next_states = next_states.to(DEVICE)
 
             head_logits, body_logits, food_logits = model(states, actions)
+            B, _, H, W = states.shape
 
-            # ----------------------------------
-            # Targets
-            # ----------------------------------
-
-            # Body target
-            target_body = next_states[:, 0:1]  # channel 0
-
-            # Head target -> convert one-hot grid to index
-            target_head_map = next_states[:, 1]  # (B,H,W)
-            B, H, W = target_head_map.shape
-            target_head_index = target_head_map.view(B, -1).argmax(dim=1)
-
-            # Food target
-            target_food = next_states[:, 2:3]
-
+            # -------- Head Loss --------
+            target_head_map = next_states[:, 1]
+            target_head_idx = target_head_map.view(B, -1).argmax(dim=1)
             head_logits_flat = head_logits.view(B, -1)
-            loss_head = F.cross_entropy(head_logits_flat, target_head_index)
+            loss_head = F.cross_entropy(head_logits_flat, target_head_idx)
 
-            # Body
-            loss_body = F.binary_cross_entropy_with_logits(body_logits, target_body)
+            # -------- Food Loss --------
+            target_food_map = next_states[:, 2]
+            target_food_idx = target_food_map.view(B, -1).argmax(dim=1)
+            food_logits_flat = food_logits.view(B, -1)
+            loss_food = F.cross_entropy(food_logits_flat, target_food_idx)
 
-            # Food
-            loss_food = F.binary_cross_entropy_with_logits(food_logits, target_food)
+            # -------- Body Loss --------
+            target_body = next_states[:, 0:1]
+            loss_body = F.binary_cross_entropy_with_logits(
+                body_logits, target_body, pos_weight=pos_weight_body
+            )
 
-            loss = loss_head + loss_body + loss_food
+            # -------- Movement Penalty --------
+            prev_head_map = states[:, 1]
+            prev_head_idx = prev_head_map.view(B, -1).argmax(dim=1)
+            pred_head_idx = head_logits_flat.argmax(dim=1)
+            prev_x, prev_y = prev_head_idx // W, prev_head_idx % W
+            pred_x, pred_y = pred_head_idx // W, pred_head_idx % W
+            movement_dist = torch.abs(prev_x - pred_x) + torch.abs(prev_y - pred_y)
+            movement_penalty = torch.mean((movement_dist - 1).clamp(min=0).float())
 
-            # ----------------------------------
-            # Backprop
-            # ----------------------------------
+            # -------- Total Loss --------
+            loss = 2.0 * loss_head + 0.5 * loss_body + 1.5 * loss_food + 0.5 * movement_penalty
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
 
-        print(f"Epoch {epoch + 1}/{EPOCHS} | Loss: {total_loss / len(loader):.4f}")
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss/len(loader):.4f}")
 
         torch.save(model.state_dict(), "residual_unet_world_model.pt")
-        print("Model saved.")
+
+    print("Training complete.")
