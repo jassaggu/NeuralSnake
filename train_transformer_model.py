@@ -4,9 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-# =========================
 # Config
-# =========================
 GRID_SIZE = 10
 NUM_CELLS = GRID_SIZE * GRID_SIZE
 STATE_CHANNELS = 3
@@ -22,9 +20,7 @@ DATA_PATH = "snake_transitions.npz"
 MODEL_PATH = "transformer_world_model.pt"
 
 
-# =========================
 # Dataset
-# =========================
 class SnakeDataset(Dataset):
     def __init__(self, path):
         data = np.load(path)
@@ -50,9 +46,7 @@ class SnakeDataset(Dataset):
         return state, action, next_state, done
 
 
-# =========================
-# Transformer World Model
-# =========================
+# Model
 class TransformerWorldModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -60,7 +54,6 @@ class TransformerWorldModel(nn.Module):
         self.cell_embed = nn.Linear(STATE_CHANNELS, EMBED_DIM)
         self.action_embed = nn.Embedding(4, EMBED_DIM)
 
-        # 🔥 NEW: Learnable positional embedding
         self.pos_embedding = nn.Parameter(
             torch.randn(1, NUM_CELLS + 1, EMBED_DIM)
         )
@@ -78,7 +71,6 @@ class TransformerWorldModel(nn.Module):
             num_layers=NUM_LAYERS
         )
 
-        # Output heads
         self.head_out = nn.Linear(EMBED_DIM, 1)
         self.body_out = nn.Linear(EMBED_DIM, 1)
         self.food_out = nn.Linear(EMBED_DIM, 1)
@@ -87,18 +79,14 @@ class TransformerWorldModel(nn.Module):
     def forward(self, state, action):
         B = state.size(0)
 
-        # Flatten grid → tokens
-        state = state.view(B, STATE_CHANNELS, -1)
-        state = state.permute(0, 2, 1)  # (B, 100, C)
+        state = state.reshape(B, STATE_CHANNELS, -1)
+        state = state.permute(0, 2, 1)
 
         cell_tokens = self.cell_embed(state)
 
-        action_token = self.action_embed(action)
-        action_token = action_token.unsqueeze(1)
+        action_token = self.action_embed(action).unsqueeze(1)
 
         tokens = torch.cat([action_token, cell_tokens], dim=1)
-
-        # 🔥 ADD POSITIONAL INFORMATION
         tokens = tokens + self.pos_embedding
 
         tokens = self.transformer(tokens)
@@ -115,9 +103,33 @@ class TransformerWorldModel(nn.Module):
         return head_logits, body_logits, food_logits, done_logit
 
 
-# =========================
-# Training
-# =========================
+# Helper: find tail cell
+def find_tail_mask(body, head):
+    """
+    body: (B,100)
+    head: (B,100)
+    returns tail mask (B,100)
+    """
+    B = body.size(0)
+
+    body_grid = body.reshape(B, GRID_SIZE, GRID_SIZE)
+    head_grid = head.reshape(B, GRID_SIZE, GRID_SIZE)
+
+    padded = F.pad(body_grid, (1,1,1,1))
+
+    neighbours = (
+        padded[:, :-2, 1:-1] +
+        padded[:, 2:, 1:-1] +
+        padded[:, 1:-1, :-2] +
+        padded[:, 1:-1, 2:]
+    )
+
+    tail = (body_grid == 1) & (neighbours == 1) & (head_grid == 0)
+
+    return tail.reshape(B, NUM_CELLS).float()
+
+
+# Training loop
 def train():
     dataset = SnakeDataset(DATA_PATH)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -125,13 +137,16 @@ def train():
     model = TransformerWorldModel().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-    # 🔥 Weight body loss to prevent collapse
     pos_weight = torch.tensor(8.0, device=DEVICE)
 
+    best_loss = float("inf")
+
     for epoch in range(EPOCHS):
+        model.train()
         total_loss = 0
 
         for state, action, next_state, done in loader:
+
             state = state.to(DEVICE)
             action = action.to(DEVICE)
             next_state = next_state.to(DEVICE)
@@ -139,14 +154,14 @@ def train():
 
             head_logits, body_logits, food_logits, done_logit = model(state, action)
 
-            next_body = next_state[:, 0].view(-1, NUM_CELLS)
-            next_head = next_state[:, 1].view(-1, NUM_CELLS)
-            next_food = next_state[:, 2].view(-1, NUM_CELLS)
+            next_body = next_state[:,0].reshape(-1, NUM_CELLS)
+            next_head = next_state[:,1].reshape(-1, NUM_CELLS)
+            next_food = next_state[:,2].reshape(-1, NUM_CELLS)
 
             head_target = torch.argmax(next_head, dim=1)
             food_target = torch.argmax(next_food, dim=1)
 
-            # ===== Losses =====
+            # Standard losses
             head_loss = F.cross_entropy(head_logits, head_target)
             food_loss = F.cross_entropy(food_logits, food_target)
 
@@ -158,7 +173,36 @@ def train():
 
             done_loss = F.binary_cross_entropy_with_logits(done_logit, done)
 
-            loss = head_loss + food_loss + body_loss + done_loss
+            # Body size regularisation
+            pred_body_prob = torch.sigmoid(body_logits)
+            pred_body_sum = pred_body_prob.sum(dim=1)
+            true_body_sum = next_body.sum(dim=1)
+
+            size_loss = F.mse_loss(pred_body_sum, true_body_sum)
+
+            # ---------- Tail dynamics loss ----------
+
+            prev_body = state[:,0].reshape(-1, NUM_CELLS)
+            prev_head = state[:,1].reshape(-1, NUM_CELLS)
+
+            tail_mask = find_tail_mask(prev_body, prev_head).to(DEVICE)
+
+            tail_prob = (pred_body_prob * tail_mask).sum(dim=1)
+
+            food_eaten = (true_body_sum > prev_body.sum(dim=1)).float()
+
+            tail_loss = ((1 - food_eaten) * tail_prob).mean()
+
+            # ---------- Final loss ----------
+
+            loss = (
+                head_loss
+                + food_loss
+                + 2.0 * body_loss
+                + done_loss
+                + 0.1 * size_loss
+                + 0.5 * tail_loss
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -166,10 +210,16 @@ def train():
 
             total_loss += loss.item()
 
-        print(f"Epoch {epoch + 1}/{EPOCHS} | Loss: {total_loss / len(loader):.4f}")
+        avg_loss = total_loss / len(loader)
 
-    torch.save(model.state_dict(), MODEL_PATH)
-    print("Model saved.")
+        print(f"Epoch {epoch + 1}/{EPOCHS} | Loss: {avg_loss:.4f}")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), MODEL_PATH)
+            print("Model improved - weights saved.")
+
+    print("Training complete.")
 
 
 if __name__ == "__main__":

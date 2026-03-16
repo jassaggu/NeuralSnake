@@ -56,7 +56,7 @@ def evaluate(model, loader):
     body_fn = 0
 
     food_consumption_correct = 0
-    illegal_states = 0
+    illegal_states = 0  # illegal states determination is incomplete, doesnt incldue body joinedness etc
 
     with torch.no_grad():
         for state, action, next_state, done in loader:
