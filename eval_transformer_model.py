@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data import random_split
 import random
 from train_transformer_model import TransformerWorldModel
+from eval_tools import get_next_logical_frame
 
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -176,38 +177,56 @@ def rollout_evaluation(model, test_dataset, num_trials=100, max_steps=50):
         idx = random.randint(0, len(test_dataset) - 1)
         state, action, next_state, done = test_dataset[idx]
 
-        current_state = state.unsqueeze(0).to(DEVICE)
+        # Convert initial state to numpy (H,W,C)
+        current_state = state.permute(1, 2, 0).cpu().numpy()
 
         steps_survived = 0
 
         for _ in range(max_steps):
 
-            action = torch.randint(0, 4, (1,), device=DEVICE)
+            action = random.randint(0, 3)
+
+            # ---------- Model prediction ----------
+            state_tensor = torch.tensor(current_state).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
+            action_tensor = torch.tensor([action]).to(DEVICE)
 
             with torch.no_grad():
-                head_logits, body_logits, food_logits, done_logit = model(current_state, action)
+                head_logits, body_logits, food_logits, done_logit = model(state_tensor, action_tensor)
 
-            head_idx = torch.argmax(head_logits, dim=1)
-            food_idx = torch.argmax(food_logits, dim=1)
-            body_map = (torch.sigmoid(body_logits) > 0.5).float()
+            head_idx = torch.argmax(head_logits, dim=1).item()
+            food_idx = torch.argmax(food_logits, dim=1).item()
+            body_map = (torch.sigmoid(body_logits) > 0.5).float().view(GRID_SIZE, GRID_SIZE).cpu().numpy()
 
-            head_map = torch.zeros((1, NUM_CELLS), device=DEVICE)
-            head_map[0, head_idx] = 1.0
+            # Build predicted state (H, W, C)
+            pred_state = np.zeros((GRID_SIZE, GRID_SIZE, 3))
 
-            food_map = torch.zeros((1, NUM_CELLS), device=DEVICE)
-            food_map[0, food_idx] = 1.0
+            # Body
+            pred_state[:, :, 0] = body_map
 
-            next_state = torch.stack([
-                body_map.view(1, GRID_SIZE, GRID_SIZE),
-                head_map.view(1, GRID_SIZE, GRID_SIZE),
-                food_map.view(1, GRID_SIZE, GRID_SIZE)
-            ], dim=1)
+            # Head
+            hx, hy = head_idx % GRID_SIZE, head_idx // GRID_SIZE
+            pred_state[hy, hx, 1] = 1
 
-            if not is_valid_state(next_state[0].cpu()):
+            # Food
+            fx, fy = food_idx % GRID_SIZE, food_idx // GRID_SIZE
+            pred_state[fy, fx, 2] = 1
+
+            # ---------- Ground truth logical step ----------
+            true_next_state, done_flag = get_next_logical_frame(current_state, action)
+
+            # If logical simulation fails → current state already invalid
+            if true_next_state is None:
                 illegal_count += 1
                 break
 
-            current_state = next_state
+            # ---------- Divergence check ----------
+            # Compare predicted vs true next state
+            if not np.array_equal(pred_state, true_next_state):
+                illegal_count += 1
+                break
+
+            # Move forward using predicted state (autoregressive rollout)
+            current_state = pred_state
             steps_survived += 1
 
         survival_lengths.append(steps_survived)
@@ -218,6 +237,75 @@ def rollout_evaluation(model, test_dataset, num_trials=100, max_steps=50):
     print("\n=== Rollout Evaluation ===")
     print(f"Average Rollout Length Before Divergence: {avg_survival:.2f}")
     print(f"Illegal State Rate (Rollout): {illegal_rate:.4f}")
+
+
+def multi_step_error_curve(model, test_dataset, num_trials=100, max_steps=20):
+    model.eval()
+
+    errors_per_step = [[] for _ in range(max_steps)]
+
+    for _ in range(num_trials):
+
+        idx = random.randint(0, len(test_dataset) - 1)
+        state, _, _, _ = test_dataset[idx]
+
+        # Start from real state
+        current_state = state.permute(1, 2, 0).cpu().numpy()
+
+        for step in range(max_steps):
+
+            action = random.randint(0, 3)
+
+            # ---------- Model prediction ----------
+            state_tensor = torch.tensor(current_state).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
+            action_tensor = torch.tensor([action]).to(DEVICE)
+
+            with torch.no_grad():
+                head_logits, body_logits, food_logits, _ = model(state_tensor, action_tensor)
+
+            head_idx = torch.argmax(head_logits, dim=1).item()
+            body_map = (torch.sigmoid(body_logits) > 0.5).float().view(GRID_SIZE, GRID_SIZE).cpu().numpy()
+
+            pred_state = np.zeros((GRID_SIZE, GRID_SIZE, 3))
+            pred_state[:, :, 0] = body_map
+
+            hx, hy = head_idx % GRID_SIZE, head_idx // GRID_SIZE
+            pred_state[hy, hx, 1] = 1
+
+            # NOTE: ignore food channel completely
+
+            # ---------- Ground truth ----------
+            true_next_state, done_flag = get_next_logical_frame(current_state, action)
+
+            if true_next_state is None:
+                break
+
+            # ---------- Compute error (ignore food channel) ----------
+            pred_no_food = pred_state[:, :, :2]
+            true_no_food = true_next_state[:, :, :2]
+
+            mse = np.mean((pred_no_food - true_no_food) ** 2)
+            errors_per_step[step].append(mse)
+
+            # Move forward using TRUE state (not predicted)
+            current_state = true_next_state
+
+            if done_flag:
+                break
+
+    # ---------- Aggregate ----------
+    avg_errors = []
+    for step_errors in errors_per_step:
+        if len(step_errors) > 0:
+            avg_errors.append(np.mean(step_errors))
+        else:
+            avg_errors.append(0)
+
+    print("\n=== Multi-Step Error Curve ===")
+    for i, e in enumerate(avg_errors):
+        print(f"Step {i + 1}: MSE = {e:.6f}")
+
+    return avg_errors
 
 
 model = TransformerWorldModel().to(DEVICE)
@@ -235,3 +323,18 @@ test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 evaluate(model, test_loader)
 rollout_evaluation(model, test_dataset)
+multi_step_error_curve(model, test_dataset)
+
+"""
+=== Single-Step Evaluation ===
+Head Accuracy: 0.9998
+Food Position Accuracy: 0.8744
+Done Accuracy: 0.9998
+Body F1 Score: 0.9660
+Food Consumption Accuracy: 0.8730
+Illegal State Rate: 0.0060
+
+=== Rollout Evaluation ===
+Average Rollout Length Before Divergence: 29.80
+Illegal State Rate (Rollout): 0.6100
+"""

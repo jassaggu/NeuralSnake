@@ -240,3 +240,11 @@ evaluate_meta_metrics(model, test_loader)
 multi_step_prediction_error(model, test_dataset)
 divergence_time(model, test_dataset)
 rollout_reward_and_length(model, test_dataset)
+
+"""
+=== Meta Model Metrics ===
+State Prediction Error (MSE): 0.002258
+Multi-step Prediction Error: 0.068679
+Divergence Time: 1.20 steps
+Average Episode Length/Survival Reward: 31.89
+"""

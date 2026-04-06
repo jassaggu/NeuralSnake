@@ -3,6 +3,7 @@ import torch
 import numpy as np
 
 from train_transformer_model import TransformerWorldModel
+#from train_world_model import WorldModel
 
 # Config
 GRID_SIZE = 10
@@ -12,7 +13,7 @@ WINDOW_SIZE = GRID_SIZE * CELL_SIZE
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-# ---- Load Correct Model ----
+# Load model, can switch for UNet
 model = TransformerWorldModel()
 model.load_state_dict(torch.load("transformer_world_model.pt", map_location=device))
 model.to(device)
@@ -26,7 +27,6 @@ pygame.display.set_caption("Learned Snake (Transformer World Model)")
 clock = pygame.time.Clock()
 
 
-# ---- Correct Channel Ordering ----
 # channel 0 = body
 # channel 1 = head
 # channel 2 = food
@@ -94,6 +94,7 @@ def reconstruct_state(head_logits, body_logits, food_logits):
 
     # BODY
     body_map = (torch.sigmoid(body_logits) > 0.5).float()
+    print("body cells:", body_map.sum().item())
 
     # FOOD
     food_idx = torch.argmax(food_logits, dim=1)
@@ -116,7 +117,6 @@ running = True
 while running:
     clock.tick(6)
 
-    # ---- Event Handling ----
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
@@ -132,7 +132,7 @@ while running:
     with torch.no_grad():
         head_logits, body_logits, food_logits, done_logit = model(state_tensor, action_tensor)
 
-    # ---- Use done_logit for termination ----
+    # Use done_logit for termination
     done_prob = torch.sigmoid(done_logit)
     done_pred = (done_prob > 0.5).item()
 
@@ -143,7 +143,7 @@ while running:
         draw_board(current_state)
         continue
 
-    # ---- Otherwise continue rollout ----
+    # Otherwise continue rollout
     next_state = reconstruct_state(head_logits, body_logits, food_logits)
     current_state = next_state.squeeze(0).cpu().numpy()
 
