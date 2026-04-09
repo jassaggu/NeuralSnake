@@ -2,24 +2,18 @@ import pygame
 import torch
 import numpy as np
 
-from train_transformer_model import TransformerWorldModel
-#from train_world_model import WorldModel
+from select_model import load_model
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 # Config
+MODEL = "unet"      # baseline, unet, transformer
 GRID_SIZE = 10
 NUM_CELLS = GRID_SIZE * GRID_SIZE
 CELL_SIZE = 40
 WINDOW_SIZE = GRID_SIZE * CELL_SIZE
 
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-
-# Load model, can switch for UNet
-model = TransformerWorldModel()
-model.load_state_dict(torch.load("transformer_world_model.pt", map_location=device))
-model.to(device)
-model.eval()
-
-print("Transformer model loaded.")
+model = load_model(MODEL, device)
 
 pygame.init()
 screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
@@ -36,7 +30,7 @@ def create_initial_state():
 
     cx, cy = GRID_SIZE // 2, GRID_SIZE // 2
 
-    state[0, cx, cy] = 1.0  # body
+    state[0, cx, cy] = 0.0  # body
     state[1, cx, cy] = 1.0  # head
 
     while True:
@@ -60,7 +54,7 @@ def draw_board(state):
         for j in range(GRID_SIZE):
             rect = pygame.Rect(j * CELL_SIZE, i * CELL_SIZE, CELL_SIZE, CELL_SIZE)
 
-            if body[i, j] > 0.5:
+            if body[i, j] > 0.1:
                 pygame.draw.rect(screen, (0, 150, 0), rect)
 
             if head[i, j] > 0.5:
