@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 
-# Device setup for Mac
+# Device
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print("Using device:", device)
 
@@ -15,82 +15,134 @@ data = np.load("snake_transitions.npz")
 states = data["states"]
 actions = data["actions"]
 next_states = data["next_states"]
+dones = data["dones"]  # ✅ added
 
-# Convert to NCHW
+# NHWC → NCHW
 states = np.transpose(states, (0, 3, 1, 2))
 next_states = np.transpose(next_states, (0, 3, 1, 2))
 
 
+# -------------------------
+# Dataset
+# -------------------------
 class SnakeDataset(Dataset):
-    def __init__(self, states, actions, next_states):
+    def __init__(self, states, actions, next_states, dones):
         self.states = torch.tensor(states, dtype=torch.float32)
         self.actions = torch.tensor(actions, dtype=torch.long)
         self.next_states = torch.tensor(next_states, dtype=torch.float32)
+        self.dones = torch.tensor(dones, dtype=torch.float32)
 
     def __len__(self):
         return len(self.states)
 
     def __getitem__(self, idx):
-        return self.states[idx], self.actions[idx], self.next_states[idx]
+        return (
+            self.states[idx],
+            self.actions[idx],
+            self.next_states[idx],
+            self.dones[idx],
+        )
 
 
-# Train / Validation split
-train_states, val_states, train_actions, val_actions, train_next, val_next = train_test_split(
-    states, actions, next_states, test_size=0.2, random_state=42
+# Train / Val split
+train_states, val_states, train_actions, val_actions, train_next, val_next, train_done, val_done = train_test_split(
+    states, actions, next_states, dones, test_size=0.2, random_state=42
 )
 
-train_dataset = SnakeDataset(train_states, train_actions, train_next)
-val_dataset = SnakeDataset(val_states, val_actions, val_next)
+train_dataset = SnakeDataset(train_states, train_actions, train_next, train_done)
+val_dataset = SnakeDataset(val_states, val_actions, val_next, val_done)
 
-# Increased batch size for GPU utilization
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=0)
-val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=0)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
 
-class WorldModel(nn.Module):
+# -------------------------
+# Model
+# -------------------------
+class BaselineCNNModel(nn.Module):
     def __init__(self, action_dim=4):
         super().__init__()
 
         self.action_embed = nn.Embedding(action_dim, 10 * 10)
 
-        self.conv1 = nn.Conv2d(4, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(32, 3, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(4, 32, 3, padding=1)
+        self.conv2 = nn.Conv2d(32, 32, 3, padding=1)
+
+        # Separate heads (IMPORTANT)
+        self.head_out = nn.Conv2d(32, 1, 1)
+        self.body_out = nn.Conv2d(32, 1, 1)
+        self.food_out = nn.Conv2d(32, 1, 1)
+
+        # Done head
+        self.done_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(32, 1)
+        )
 
     def forward(self, state, action):
-        batch_size = state.size(0)
+        B = state.size(0)
 
-        action_map = self.action_embed(action)
-        action_map = action_map.view(batch_size, 1, 10, 10)
+        action_map = self.action_embed(action).view(B, 1, 10, 10)
 
         x = torch.cat([state, action_map], dim=1)
 
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
-        x = torch.sigmoid(self.conv3(x))
 
-        return x
+        # Flatten outputs to (B,100)
+        head_logits = self.head_out(x).view(B, -1)
+        body_logits = self.body_out(x).view(B, -1)
+        food_logits = self.food_out(x).view(B, -1)
+
+        done_logit = self.done_head(x).squeeze(-1)
+
+        return head_logits, body_logits, food_logits, done_logit
 
 
+# -------------------------
+# Training
+# -------------------------
 if __name__ == "__main__":
-    model = WorldModel().to(device)
+    model = BaselineCNNModel().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.BCELoss()
 
     print("Starting training...")
+
+    best_loss = float("inf")
 
     for epoch in range(50):
 
         model.train()
         total_train_loss = 0
 
-        for state, action, next_state in train_loader:
+        for state, action, next_state, done in train_loader:
             state = state.to(device)
             action = action.to(device)
             next_state = next_state.to(device)
+            done = done.to(device)
 
-            pred = model(state, action)
-            loss = criterion(pred, next_state)
+            head_logits, body_logits, food_logits, done_logit = model(state, action)
+
+            B, _, H, W = state.shape
+
+            # -------- Targets --------
+            next_body = next_state[:, 0].view(B, -1)
+            next_head = next_state[:, 1].view(B, -1)
+            next_food = next_state[:, 2].view(B, -1)
+
+            head_target = next_head.argmax(dim=1)
+            food_target = next_food.argmax(dim=1)
+
+            # -------- Losses --------
+            loss_head = F.cross_entropy(head_logits, head_target)
+            loss_food = F.cross_entropy(food_logits, food_target)
+
+            loss_body = F.binary_cross_entropy_with_logits(body_logits, next_body)
+
+            loss_done = F.binary_cross_entropy_with_logits(done_logit, done)
+
+            loss = loss_head + loss_food + loss_body + loss_done
 
             optimizer.zero_grad()
             loss.backward()
@@ -98,59 +150,10 @@ if __name__ == "__main__":
 
             total_train_loss += loss.item()
 
-        avg_train_loss = total_train_loss / len(train_loader)
+        avg_loss = total_train_loss / len(train_loader)
+        print(f"Epoch {epoch:02d} | Train Loss: {avg_loss:.4f}")
+        if avg_loss < best_loss:
+            torch.save(model.state_dict(), "baseline_cnn_world_model.pt")
+            print("Loss improved, model saved.")
 
-        # Validation
-        model.eval()
-        total_val_loss = 0
-        total_correct = 0
-        total_cells = 0
-        total_head_error = 0
-        total_samples = 0
-
-        with torch.no_grad():
-            for state, action, next_state in val_loader:
-                state = state.to(device)
-                action = action.to(device)
-                next_state = next_state.to(device)
-
-                pred = model(state, action)
-                loss = criterion(pred, next_state)
-
-                total_val_loss += loss.item()
-
-                # ---- Per-cell accuracy ----
-                total_correct += (pred.round() == next_state).float().sum().item()
-                total_cells += next_state.numel()
-
-                # ---- Head spatial error ----
-                pred_head_map = pred[:, 0]
-                true_head_map = next_state[:, 0]
-
-                pred_coords = pred_head_map.view(pred.size(0), -1).argmax(dim=1)
-                true_coords = true_head_map.view(next_state.size(0), -1).argmax(dim=1)
-
-                pred_x = pred_coords // 10
-                pred_y = pred_coords % 10
-                true_x = true_coords // 10
-                true_y = true_coords % 10
-
-                dist = torch.sqrt((pred_x - true_x) ** 2 + (pred_y - true_y) ** 2)
-
-                total_head_error += dist.sum().item()
-                total_samples += dist.size(0)
-
-        avg_val_loss = total_val_loss / len(val_loader)
-        cell_accuracy = total_correct / total_cells
-        avg_head_error = total_head_error / total_samples
-
-        print(
-            f"Epoch {epoch:02d} | "
-            f"Train Loss: {avg_train_loss:.4f} | "
-            f"Val Loss: {avg_val_loss:.4f} | "
-            f"Cell Acc: {cell_accuracy:.4f} | "
-            f"Head Dist: {avg_head_error:.4f}"
-        )
-
-    torch.save(model.state_dict(), "world_model.pt")
     print("Training complete. Model saved.")

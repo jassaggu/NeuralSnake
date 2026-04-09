@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
+
 # -------------------------
 # Residual Block (GroupNorm)
 # -------------------------
@@ -23,7 +24,7 @@ class ResBlock(nn.Module):
 
 
 # -------------------------
-# Downsample (single level)
+# Downsample
 # -------------------------
 class DownBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -90,16 +91,31 @@ class ResidualUNetWorldModel(nn.Module):
         self.body_out = nn.Conv2d(32, 1, 1)
         self.food_out = nn.Conv2d(32, 1, 1)
 
+        # ✅ ADDED
+        self.done_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(32, 1)
+        )
+
     def forward(self, state, action):
         x1 = F.relu(self.input_conv(state))
         x1 = self.res1(x1)
+
         x2 = self.down1(x1)
         x2 = self.film(x2, action)
+
         x = self.up1(x2, x1)
-        head_logits = self.head_out(x)
-        body_logits = self.body_out(x)
-        food_logits = self.food_out(x)
-        return head_logits, body_logits, food_logits
+
+        # ✅ Flatten to (B, 100)
+        head_logits = self.head_out(x).view(x.size(0), -1)
+        body_logits = self.body_out(x).view(x.size(0), -1)
+        food_logits = self.food_out(x).view(x.size(0), -1)
+
+        # ✅ Added done prediction
+        done_logit = self.done_head(x).squeeze(-1)
+
+        return head_logits, body_logits, food_logits, done_logit
 
 
 # -------------------------
@@ -111,17 +127,18 @@ class SnakeDataset(Dataset):
         self.states = data["states"]
         self.actions = data["actions"]
         self.next_states = data["next_states"]
+        self.dones = data["dones"]  # ✅ ADDED
 
     def __len__(self):
         return len(self.states)
 
     def __getitem__(self, idx):
-        state = torch.tensor(self.states[idx], dtype=torch.float32)
-        next_state = torch.tensor(self.next_states[idx], dtype=torch.float32)
+        state = torch.tensor(self.states[idx], dtype=torch.float32).permute(2, 0, 1)
+        next_state = torch.tensor(self.next_states[idx], dtype=torch.float32).permute(2, 0, 1)
         action = torch.tensor(self.actions[idx], dtype=torch.long)
-        state = state.permute(2, 0, 1)
-        next_state = next_state.permute(2, 0, 1)
-        return state, action, next_state
+        done = torch.tensor(self.dones[idx], dtype=torch.float32)  # ✅ ADDED
+
+        return state, action, next_state, done
 
 
 # -------------------------
@@ -140,57 +157,70 @@ if __name__ == "__main__":
     model = ResidualUNetWorldModel().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-    pos_weight_body = torch.tensor([5.0]).to(DEVICE)  # weight for sparse body
+    pos_weight_body = torch.tensor([5.0]).to(DEVICE)
 
     for epoch in range(EPOCHS):
         total_loss = 0
         model.train()
 
-        for states, actions, next_states in loader:
+        for states, actions, next_states, dones in loader:  # ✅ UPDATED
             states = states.to(DEVICE)
             actions = actions.to(DEVICE)
             next_states = next_states.to(DEVICE)
+            dones = dones.to(DEVICE)
 
-            head_logits, body_logits, food_logits = model(states, actions)
+            # ✅ UPDATED unpack
+            head_logits, body_logits, food_logits, done_logit = model(states, actions)
+
             B, _, H, W = states.shape
 
             # -------- Head Loss --------
-            target_head_map = next_states[:, 1]
-            target_head_idx = target_head_map.view(B, -1).argmax(dim=1)
-            head_logits_flat = head_logits.view(B, -1)
-            loss_head = F.cross_entropy(head_logits_flat, target_head_idx)
+            target_head = next_states[:, 1].view(B, -1)
+            head_target_idx = target_head.argmax(dim=1)
+            loss_head = F.cross_entropy(head_logits, head_target_idx)
 
             # -------- Food Loss --------
-            target_food_map = next_states[:, 2]
-            target_food_idx = target_food_map.view(B, -1).argmax(dim=1)
-            food_logits_flat = food_logits.view(B, -1)
-            loss_food = F.cross_entropy(food_logits_flat, target_food_idx)
+            target_food = next_states[:, 2].view(B, -1)
+            food_target_idx = target_food.argmax(dim=1)
+            loss_food = F.cross_entropy(food_logits, food_target_idx)
 
             # -------- Body Loss --------
-            target_body = next_states[:, 0:1]
+            target_body = next_states[:, 0].view(B, -1)
             loss_body = F.binary_cross_entropy_with_logits(
                 body_logits, target_body, pos_weight=pos_weight_body
             )
 
+            # -------- Done Loss --------
+            loss_done = F.binary_cross_entropy_with_logits(done_logit, dones)
+
             # -------- Movement Penalty --------
-            prev_head_map = states[:, 1]
-            prev_head_idx = prev_head_map.view(B, -1).argmax(dim=1)
-            pred_head_idx = head_logits_flat.argmax(dim=1)
+            prev_head = states[:, 1].view(B, -1)
+            prev_head_idx = prev_head.argmax(dim=1)
+            pred_head_idx = head_logits.argmax(dim=1)
+
             prev_x, prev_y = prev_head_idx // W, prev_head_idx % W
             pred_x, pred_y = pred_head_idx // W, pred_head_idx % W
+
             movement_dist = torch.abs(prev_x - pred_x) + torch.abs(prev_y - pred_y)
             movement_penalty = torch.mean((movement_dist - 1).clamp(min=0).float())
 
             # -------- Total Loss --------
-            loss = 2.0 * loss_head + 0.5 * loss_body + 1.5 * loss_food + 0.5 * movement_penalty
+            loss = (
+                2.0 * loss_head
+                + 0.5 * loss_body
+                + 1.5 * loss_food
+                + 0.5 * movement_penalty
+                + 1.0 * loss_done
+            )
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
             total_loss += loss.item()
 
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss/len(loader):.4f}")
+        print(f"Epoch {epoch + 1}/{EPOCHS} | Loss: {total_loss / len(loader):.4f}")
 
-        torch.save(model.state_dict(), "residual_unet_world_model.pt")
+        torch.save(model.state_dict(), "unet_world_model.pt")
 
     print("Training complete.")
