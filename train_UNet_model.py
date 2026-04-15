@@ -72,7 +72,7 @@ class FiLM(nn.Module):
 
 
 # -------------------------
-# World Model
+# World Model (FIXED)
 # -------------------------
 class ResidualUNetWorldModel(nn.Module):
     def __init__(self, num_actions=4):
@@ -91,7 +91,6 @@ class ResidualUNetWorldModel(nn.Module):
         self.body_out = nn.Conv2d(32, 1, 1)
         self.food_out = nn.Conv2d(32, 1, 1)
 
-        # ✅ ADDED
         self.done_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -107,12 +106,11 @@ class ResidualUNetWorldModel(nn.Module):
 
         x = self.up1(x2, x1)
 
-        # ✅ Flatten to (B, 100)
-        head_logits = self.head_out(x).view(x.size(0), -1)
-        body_logits = self.body_out(x).view(x.size(0), -1)
-        food_logits = self.food_out(x).view(x.size(0), -1)
+        # ✅ KEEP SPATIAL SHAPE (B,1,H,W)
+        head_logits = self.head_out(x)
+        body_logits = self.body_out(x)
+        food_logits = self.food_out(x)
 
-        # ✅ Added done prediction
         done_logit = self.done_head(x).squeeze(-1)
 
         return head_logits, body_logits, food_logits, done_logit
@@ -127,7 +125,7 @@ class SnakeDataset(Dataset):
         self.states = data["states"]
         self.actions = data["actions"]
         self.next_states = data["next_states"]
-        self.dones = data["dones"]  # ✅ ADDED
+        self.dones = data["dones"]
 
     def __len__(self):
         return len(self.states)
@@ -136,13 +134,13 @@ class SnakeDataset(Dataset):
         state = torch.tensor(self.states[idx], dtype=torch.float32).permute(2, 0, 1)
         next_state = torch.tensor(self.next_states[idx], dtype=torch.float32).permute(2, 0, 1)
         action = torch.tensor(self.actions[idx], dtype=torch.long)
-        done = torch.tensor(self.dones[idx], dtype=torch.float32)  # ✅ ADDED
+        done = torch.tensor(self.dones[idx], dtype=torch.float32)
 
         return state, action, next_state, done
 
 
 # -------------------------
-# Training
+# Training (UPDATED)
 # -------------------------
 if __name__ == "__main__":
     DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -163,40 +161,44 @@ if __name__ == "__main__":
         total_loss = 0
         model.train()
 
-        for states, actions, next_states, dones in loader:  # ✅ UPDATED
+        for states, actions, next_states, dones in loader:
             states = states.to(DEVICE)
             actions = actions.to(DEVICE)
             next_states = next_states.to(DEVICE)
             dones = dones.to(DEVICE)
 
-            # ✅ UPDATED unpack
             head_logits, body_logits, food_logits, done_logit = model(states, actions)
 
-            B, _, H, W = states.shape
+            B, _, H, W = states.shape  # ✅ dynamic size
 
-            # -------- Head Loss --------
+            # -------- Flatten dynamically --------
+            head_logits_flat = head_logits.view(B, -1)
+            food_logits_flat = food_logits.view(B, -1)
+            body_logits_flat = body_logits.view(B, -1)
+
+            # -------- Targets --------
             target_head = next_states[:, 1].view(B, -1)
             head_target_idx = target_head.argmax(dim=1)
-            loss_head = F.cross_entropy(head_logits, head_target_idx)
 
-            # -------- Food Loss --------
             target_food = next_states[:, 2].view(B, -1)
             food_target_idx = target_food.argmax(dim=1)
-            loss_food = F.cross_entropy(food_logits, food_target_idx)
 
-            # -------- Body Loss --------
             target_body = next_states[:, 0].view(B, -1)
+
+            # -------- Losses --------
+            loss_head = F.cross_entropy(head_logits_flat, head_target_idx)
+            loss_food = F.cross_entropy(food_logits_flat, food_target_idx)
+
             loss_body = F.binary_cross_entropy_with_logits(
-                body_logits, target_body, pos_weight=pos_weight_body
+                body_logits_flat, target_body, pos_weight=pos_weight_body
             )
 
-            # -------- Done Loss --------
             loss_done = F.binary_cross_entropy_with_logits(done_logit, dones)
 
-            # -------- Movement Penalty --------
+            # -------- Movement Penalty (dynamic) --------
             prev_head = states[:, 1].view(B, -1)
             prev_head_idx = prev_head.argmax(dim=1)
-            pred_head_idx = head_logits.argmax(dim=1)
+            pred_head_idx = head_logits_flat.argmax(dim=1)
 
             prev_x, prev_y = prev_head_idx // W, prev_head_idx % W
             pred_x, pred_y = pred_head_idx // W, pred_head_idx % W
@@ -206,11 +208,11 @@ if __name__ == "__main__":
 
             # -------- Total Loss --------
             loss = (
-                2.0 * loss_head
-                + 0.5 * loss_body
-                + 1.5 * loss_food
-                + 0.5 * movement_penalty
-                + 1.0 * loss_done
+                    2.0 * loss_head
+                    + 0.5 * loss_body
+                    + 1.5 * loss_food
+                    + 0.5 * movement_penalty
+                    + 1.0 * loss_done
             )
 
             optimizer.zero_grad()

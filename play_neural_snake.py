@@ -8,16 +8,15 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 # Config
 MODEL = "unet"      # baseline, unet, transformer
-GRID_SIZE = 10
-NUM_CELLS = GRID_SIZE * GRID_SIZE
-CELL_SIZE = 40
+GRID_SIZE = 100      # change this freely now
+CELL_SIZE = 10
 WINDOW_SIZE = GRID_SIZE * CELL_SIZE
 
 model = load_model(MODEL, device)
 
 pygame.init()
 screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
-pygame.display.set_caption("Learned Snake (Transformer World Model)")
+pygame.display.set_caption("Learned Snake (Neural World Model)")
 clock = pygame.time.Clock()
 
 
@@ -30,7 +29,6 @@ def create_initial_state():
 
     cx, cy = GRID_SIZE // 2, GRID_SIZE // 2
 
-    state[0, cx, cy] = 0.0  # body
     state[1, cx, cy] = 1.0  # head
 
     while True:
@@ -50,8 +48,10 @@ def draw_board(state):
     head = state[1]
     food = state[2]
 
-    for i in range(GRID_SIZE):
-        for j in range(GRID_SIZE):
+    H, W = body.shape
+
+    for i in range(H):
+        for j in range(W):
             rect = pygame.Rect(j * CELL_SIZE, i * CELL_SIZE, CELL_SIZE, CELL_SIZE)
 
             if body[i, j] > 0.1:
@@ -81,24 +81,41 @@ def get_action_from_key(key):
 
 
 def reconstruct_state(head_logits, body_logits, food_logits):
-    # HEAD
+    # ---- Handle both flattened and spatial outputs ----
+    if head_logits.dim() == 4:
+        # (B, 1, H, W) → (B, N)
+        B, _, H, W = head_logits.shape
+        N = H * W
+
+        head_logits = head_logits.view(B, -1)
+        body_logits = body_logits.view(B, -1)
+        food_logits = food_logits.view(B, -1)
+
+    elif head_logits.dim() == 2:
+        # (B, N)
+        B, N = head_logits.shape
+        H = W = int(np.sqrt(N))
+    else:
+        raise ValueError(f"Unexpected logits shape: {head_logits.shape}")
+
+    # ---- HEAD ----
     head_idx = torch.argmax(head_logits, dim=1)
-    head_map = torch.zeros((1, NUM_CELLS), device=device)
-    head_map[0, head_idx] = 1.0
+    head_map = torch.zeros((B, N), device=device)
+    head_map[torch.arange(B), head_idx] = 1.0
 
-    # BODY
+    # ---- BODY ----
     body_map = (torch.sigmoid(body_logits) > 0.5).float()
-    print("body cells:", body_map.sum().item())
 
-    # FOOD
+    # ---- FOOD ----
     food_idx = torch.argmax(food_logits, dim=1)
-    food_map = torch.zeros((1, NUM_CELLS), device=device)
-    food_map[0, food_idx] = 1.0
+    food_map = torch.zeros((B, N), device=device)
+    food_map[torch.arange(B), food_idx] = 1.0
 
+    # ---- Reconstruct grid ----
     next_state = torch.stack([
-        body_map.view(1, GRID_SIZE, GRID_SIZE),
-        head_map.view(1, GRID_SIZE, GRID_SIZE),
-        food_map.view(1, GRID_SIZE, GRID_SIZE)
+        body_map.view(B, H, W),
+        head_map.view(B, H, W),
+        food_map.view(B, H, W)
     ], dim=1)
 
     return next_state
@@ -126,7 +143,7 @@ while running:
     with torch.no_grad():
         head_logits, body_logits, food_logits, done_logit = model(state_tensor, action_tensor)
 
-    # Use done_logit for termination
+    # termination
     done_prob = torch.sigmoid(done_logit)
     done_pred = (done_prob > 0.5).item()
 
@@ -137,7 +154,6 @@ while running:
         draw_board(current_state)
         continue
 
-    # Otherwise continue rollout
     next_state = reconstruct_state(head_logits, body_logits, food_logits)
     current_state = next_state.squeeze(0).cpu().numpy()
 
