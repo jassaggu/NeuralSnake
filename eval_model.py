@@ -1,27 +1,30 @@
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data import random_split
+from torch.utils.data import Dataset, DataLoader, random_split
+from collections import deque
 import random
-from train_transformer_model import TransformerWorldModel
-from eval_tools import get_next_logical_frame
+
+from select_model import load_model
+from eval_tools import generate_random_snake_state
 
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 DATA_PATH = "snake_transitions.npz"
-MODEL_PATH = "transformer_world_model.pt"
-GRID_SIZE = 10
 BATCH_SIZE = 128
-NUM_CELLS = GRID_SIZE * GRID_SIZE
+GRID_SIZE = 10
+
+UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
+ACTIONS = [UP, DOWN, LEFT, RIGHT]
 
 
+# -------------------------
+# Dataset
+# -------------------------
 class SnakeDataset(Dataset):
     def __init__(self, path):
         data = np.load(path)
-        self.states = data["states"]  # (N, H, W, C)
-        self.actions = data["actions"]  # (N,)
+        self.states = data["states"]
+        self.actions = data["actions"]
         self.next_states = data["next_states"]
         self.dones = data["dones"]
 
@@ -29,312 +32,441 @@ class SnakeDataset(Dataset):
         return len(self.states)
 
     def __getitem__(self, idx):
-        state = self.states[idx]
-        action = self.actions[idx]
-        next_state = self.next_states[idx]
-        done = self.dones[idx]
-
-        # Convert (H,W,C) -> (C,H,W)
-        state = torch.tensor(state).permute(2, 0, 1).float()
-        next_state = torch.tensor(next_state).permute(2, 0, 1).float()
-        action = torch.tensor(action).long()
-        done = torch.tensor(done).float()
-
+        state = torch.tensor(self.states[idx]).permute(2, 0, 1).float()
+        next_state = torch.tensor(self.next_states[idx]).permute(2, 0, 1).float()
+        action = torch.tensor(self.actions[idx]).long()
+        done = torch.tensor(self.dones[idx]).float()
         return state, action, next_state, done
 
 
-def evaluate(model, loader):
-    model.eval()
-
-    total = 0
-
-    head_correct = 0
-    food_correct = 0
-    done_correct = 0
-
-    body_tp = 0
-    body_fp = 0
-    body_fn = 0
-
-    food_consumption_correct = 0
-    illegal_states = 0  # illegal states determination is incomplete, doesnt incldue body joinedness etc
-
-    with torch.no_grad():
-        for state, action, next_state, done in loader:
-            state = state.to(DEVICE)
-            action = action.to(DEVICE)
-            next_state = next_state.to(DEVICE)
-            done = done.to(DEVICE)
-
-            head_logits, body_logits, food_logits, done_logit = model(state, action)
-
-            B = state.size(0)
-            total += B
-
-            # ---------- Targets ----------
-            next_body = next_state[:, 0].view(B, NUM_CELLS)
-            next_head = next_state[:, 1].view(B, NUM_CELLS)
-            next_food = next_state[:, 2].view(B, NUM_CELLS)
-
-            head_target = torch.argmax(next_head, dim=1)
-            food_target = torch.argmax(next_food, dim=1)
-
-            # Food consumption ground truth:
-            # food disappears if head moves into food
-            prev_head = state[:, 1].view(B, NUM_CELLS)
-            prev_food = state[:, 2].view(B, NUM_CELLS)
-
-            prev_head_idx = torch.argmax(prev_head, dim=1)
-            prev_food_idx = torch.argmax(prev_food, dim=1)
-
-            true_food_consumed = (prev_head_idx == prev_food_idx)
-
-            # ---------- Predictions ----------
-            head_pred = torch.argmax(head_logits, dim=1)
-            food_pred = torch.argmax(food_logits, dim=1)
-            done_pred = (torch.sigmoid(done_logit) > 0.5).float()
-            body_pred = (torch.sigmoid(body_logits) > 0.5).float()
-
-            # ---------- Accuracy Metrics ----------
-            head_correct += (head_pred == head_target).sum().item()
-            food_correct += (food_pred == food_target).sum().item()
-            done_correct += (done_pred == done).sum().item()
-
-            # ---------- Body F1 ----------
-            body_tp += ((body_pred.view(B, -1) == 1) & (next_body == 1)).sum().item()
-            body_fp += ((body_pred.view(B, -1) == 1) & (next_body == 0)).sum().item()
-            body_fn += ((body_pred.view(B, -1) == 0) & (next_body == 1)).sum().item()
-
-            # ---------- Food Consumption Accuracy ----------
-            pred_food_consumed = (head_pred == prev_food_idx)
-            food_consumption_correct += (pred_food_consumed == true_food_consumed).sum().item()
-
-            # ---------- Illegal State Check ----------
-            for i in range(B):
-
-                head_map = torch.zeros(NUM_CELLS)
-                head_map[head_pred[i]] = 1
-                head_map = head_map.view(GRID_SIZE, GRID_SIZE)
-
-                food_map = torch.zeros(NUM_CELLS)
-                food_map[food_pred[i]] = 1
-                food_map = food_map.view(GRID_SIZE, GRID_SIZE)
-
-                # FIX: reshape full body prediction
-                body_map = body_pred[i].view(GRID_SIZE, GRID_SIZE).cpu()
-
-                state_tensor = torch.stack([body_map, head_map, food_map])
-
-                if not is_valid_state(state_tensor):
-                    illegal_states += 1
-
-    head_acc = head_correct / total
-    food_acc = food_correct / total
-    done_acc = done_correct / total
-
-    precision = body_tp / (body_tp + body_fp + 1e-8)
-    recall = body_tp / (body_tp + body_fn + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
-
-    food_consumption_acc = food_consumption_correct / total
-    illegal_rate = illegal_states / total
-
-    print("\n=== Single-Step Evaluation ===")
-    print(f"Head Accuracy: {head_acc:.4f}")
-    print(f"Food Position Accuracy: {food_acc:.4f}")
-    print(f"Done Accuracy: {done_acc:.4f}")
-    print(f"Body F1 Score: {f1:.4f}")
-    print(f"Food Consumption Accuracy: {food_consumption_acc:.4f}")
-    print(f"Illegal State Rate: {illegal_rate:.4f}")
+# -------------------------
+# Helper
+# -------------------------
+def flatten_logits(logits):
+    """
+    Ensures compatibility across:
+    - U-Net:               (B, 1, H, W)
+    - Transformer/Baseline: (B, N)
+    """
+    if logits.dim() == 4:
+        return logits.view(logits.size(0), -1)
+    return logits
 
 
-def is_valid_state(state):
-    body = state[0]
-    head = state[1]
-    food = state[2]
+# -------------------------
+# State Validity Check
+# -------------------------
+def is_valid_state(state_tensor):
+    """
+    Checks whether a (3, H, W) state tensor represents a legal Snake game state.
 
+    Channel layout (matching generate_data.py):
+        0 = body
+        1 = head
+        2 = food
+
+    Rules:
+        1. Exactly one head cell.
+        2. Exactly one food cell.
+        3. No overlap between any pair of channels.
+        4. All body cells (if any) are connected to the head via 4-connectivity,
+           forming a single component — no disconnected body islands.
+    """
+    if isinstance(state_tensor, torch.Tensor):
+        state = state_tensor.cpu().numpy()
+    else:
+        state = state_tensor  # already numpy
+
+    body = (state[0] > 0.5).astype(np.uint8)  # channel 0
+    head = (state[1] > 0.5).astype(np.uint8)  # channel 1
+    food = (state[2] > 0.5).astype(np.uint8)  # channel 2
+
+    # Rule 1 — exactly one head
     if head.sum() != 1:
         return False
 
+    # Rule 2 — exactly one food
     if food.sum() != 1:
         return False
 
-    # head overlapping body
-    if (body * head).sum() > 0:
+    # Rule 3 — no channel overlap
+    if np.any((head + body) > 1):
         return False
+    if np.any((head + food) > 1):
+        return False
+    if np.any((body + food) > 1):
+        return False
+
+    # Rule 4 — body cells (if any) must all be 4-connected to the head
+    body_count = int(body.sum())
+    if body_count > 0:
+        H, W = head.shape
+        head_pos = tuple(np.argwhere(head == 1)[0])
+
+        # BFS from head over (head | body) cells
+        occupied = (head | body).astype(bool)
+        visited = set()
+        queue = deque([head_pos])
+        visited.add(head_pos)
+
+        while queue:
+            r, c = queue.popleft()
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < H and 0 <= nc < W:
+                    if occupied[nr, nc] and (nr, nc) not in visited:
+                        visited.add((nr, nc))
+                        queue.append((nr, nc))
+
+        # Every body cell must have been reached from the head
+        body_positions = set(map(tuple, np.argwhere(body == 1)))
+        if not body_positions.issubset(visited):
+            return False
 
     return True
 
 
-def rollout_evaluation(model, test_dataset, num_trials=100, max_steps=50):
+def rules_based_next_state(state_np, action, grid_size=GRID_SIZE):
+    """
+    Given a (3, H, W) state array and an integer action, returns the ground-truth
+    next state and done flag by applying the true Snake game rules.
+
+    The snake list is reconstructed from the spatial grid via BFS from the head,
+    which gives us the set of occupied cells; we approximate tail removal by
+    picking the body cell furthest (graph distance) from the head as the tail.
+
+    Args:
+        state_np : np.ndarray (3, H, W)
+        action   : int  (0=UP, 1=DOWN, 2=LEFT, 3=RIGHT)
+        grid_size: int
+
+    Returns:
+        next_state : np.ndarray (3, H, W) float32
+        done       : bool
+    """
+    H = W = grid_size
+    body_map = (state_np[0] > 0.5)
+    head_map = (state_np[1] > 0.5)
+    food_map = (state_np[2] > 0.5)
+
+    head_pos = tuple(np.argwhere(head_map)[0])  # (row, col)
+    food_pos = tuple(np.argwhere(food_map)[0])
+
+    # Compute new head position
+    hr, hc = head_pos
+    if action == UP:
+        hr -= 1
+    elif action == DOWN:
+        hr += 1
+    elif action == LEFT:
+        hc -= 1
+    elif action == RIGHT:
+        hc += 1
+    new_head = (hr, hc)
+
+    # Occupied cells = head + body
+    occupied = set(map(tuple, np.argwhere(head_map | body_map)))
+
+    # Collision check
+    if not (0 <= hr < H and 0 <= hc < W) or new_head in occupied:
+        # On death return current state and done=True
+        return state_np.copy(), True
+
+    ate_food = (new_head == food_pos)
+
+    # Find the tail — the body cell with the greatest BFS distance from the head.
+    # This correctly identifies which end to remove when not eating.
+    tail_pos = None
+    if not ate_food and body_map.any():
+        dist = {head_pos: 0}
+        queue = deque([head_pos])
+        while queue:
+            pos = queue.popleft()
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nb = (pos[0] + dr, pos[1] + dc)
+                if nb not in dist and nb in occupied:
+                    dist[nb] = dist[pos] + 1
+                    queue.append(nb)
+        tail_pos = max(dist, key=dist.get)
+
+    # Build next state
+    next_state = np.zeros((3, H, W), dtype=np.float32)
+
+    # Copy existing body+head into body channel, then remove tail
+    new_body = occupied.copy()
+    if tail_pos is not None:
+        new_body.discard(tail_pos)
+
+    # New head is not a body cell
+    new_body.discard(new_head)
+
+    for (r, c) in new_body:
+        next_state[0, r, c] = 1.0  # body
+
+    next_state[1, new_head[0], new_head[1]] = 1.0  # head
+
+    if ate_food:
+        # Spawn new food on a free cell
+        all_occupied = new_body | {new_head}
+        free = [(r2, c2) for r2 in range(H) for c2 in range(W)
+                if (r2, c2) not in all_occupied]
+        if free:
+            fr, fc = random.choice(free)
+            next_state[2, fr, fc] = 1.0
+        # (if board is full, no food — edge case)
+    else:
+        next_state[2, food_pos[0], food_pos[1]] = 1.0
+
+    return next_state, False
+
+
+# -------------------------
+# Shared Metric Computation
+# -------------------------
+def compute_metrics(
+        all_head_correct,
+        all_food_correct,
+        all_done_correct,
+        all_body_tp, all_body_fp, all_body_fn,
+        all_food_consumption_correct, all_food_consumption_total,
+        all_illegal,
+        total,
+):
+    head_acc = sum(all_head_correct) / total
+    food_acc = sum(all_food_correct) / total
+    done_acc = sum(all_done_correct) / total
+
+    tp = sum(all_body_tp)
+    fp = sum(all_body_fp)
+    fn = sum(all_body_fn)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)
+          if (precision + recall) > 0 else 0.0)
+
+    fc_total = sum(all_food_consumption_total)
+    food_consumption_acc = (sum(all_food_consumption_correct) / fc_total
+                            if fc_total > 0 else float("nan"))
+
+    illegal_rate = sum(all_illegal) / total
+
+    return {
+        "head_acc": head_acc,
+        "food_acc": food_acc,
+        "done_acc": done_acc,
+        "body_f1": f1,
+        "food_consumption_acc": food_consumption_acc,
+        "illegal_rate": illegal_rate,
+    }
+
+
+def print_metrics(metrics, label):
+    print(f"\n=== {label} ===")
+    print(f"  Head Accuracy:           {metrics['head_acc']:.4f}")
+    print(f"  Food Position Accuracy:  {metrics['food_acc']:.4f}")
+    print(f"  Done Accuracy:           {metrics['done_acc']:.4f}")
+    print(f"  Body F1 Score:           {metrics['body_f1']:.4f}")
+    print(f"  Food Consumption Acc:    {metrics['food_consumption_acc']:.4f}")
+    print(f"  Illegal State Rate:      {metrics['illegal_rate']:.4f}")
+
+
+def _accumulate_batch(
+        states, actions, next_states, dones, model,
+        all_head_correct, all_food_correct, all_done_correct,
+        all_body_tp, all_body_fp, all_body_fn,
+        all_food_consumption_correct, all_food_consumption_total,
+        all_illegal,
+):
+    """
+    Runs one batch through the model, decodes predictions, and accumulates
+    metric accumulators in-place.
+    """
+    with torch.no_grad():
+        head_logits, body_logits, food_logits, done_logit = model(states, actions)
+
+    B = states.size(0)
+    H = W = GRID_SIZE
+    N = H * W
+
+    head_flat = flatten_logits(head_logits)  # (B, N)
+    food_flat = flatten_logits(food_logits)  # (B, N)
+    body_flat = flatten_logits(body_logits)  # (B, N)
+
+    pred_head_idx = head_flat.argmax(dim=1)
+    pred_food_idx = food_flat.argmax(dim=1)
+    pred_body_bin = (torch.sigmoid(body_flat) > 0.5).float()
+    pred_done = (torch.sigmoid(done_logit) > 0.5).float()
+
+    target_head = next_states[:, 1].view(B, -1)  # channel 1 = head
+    target_food = next_states[:, 2].view(B, -1)  # channel 2 = food
+    target_body = next_states[:, 0].view(B, -1)  # channel 0 = body
+
+    gt_head_idx = target_head.argmax(dim=1)
+    gt_food_idx = target_food.argmax(dim=1)
+
+    # Head accuracy
+    all_head_correct.extend((pred_head_idx == gt_head_idx).cpu().tolist())
+
+    # Food position accuracy
+    all_food_correct.extend((pred_food_idx == gt_food_idx).cpu().tolist())
+
+    # Done accuracy
+    all_done_correct.extend((pred_done.squeeze(-1) == dones).cpu().tolist())
+
+    # Body F1 components
+    tp = (pred_body_bin * target_body).sum(dim=1)
+    fp = (pred_body_bin * (1 - target_body)).sum(dim=1)
+    fn = ((1 - pred_body_bin) * target_body).sum(dim=1)
+    all_body_tp.extend(tp.cpu().tolist())
+    all_body_fp.extend(fp.cpu().tolist())
+    all_body_fn.extend(fn.cpu().tolist())
+
+    # Food consumption accuracy
+    # A food-consumption event occurs when the head moves onto the food cell.
+    prev_food = states[:, 2].view(B, -1)  # food in current state
+    gt_consumed = (gt_head_idx == prev_food.argmax(dim=1))
+    pred_consumed = (pred_head_idx == prev_food.argmax(dim=1))
+    for gt_c, pr_c in zip(gt_consumed.cpu().tolist(), pred_consumed.cpu().tolist()):
+        if gt_c:  # only score on actual consumption events
+            all_food_consumption_correct.append(int(gt_c == pr_c))
+            all_food_consumption_total.append(1)
+
+    # Illegal state rate — reconstruct predicted next state and validate
+    pred_head_idx_np = pred_head_idx.cpu().numpy()
+    pred_food_idx_np = pred_food_idx.cpu().numpy()
+    pred_body_np = pred_body_bin.cpu().numpy()
+
+    for i in range(B):
+        pred_state = np.zeros((3, H, W), dtype=np.float32)
+        ph = pred_head_idx_np[i]
+        pred_state[1, ph // W, ph % W] = 1.0
+        pf = pred_food_idx_np[i]
+        pred_state[2, pf // W, pf % W] = 1.0
+        pred_state[0] = pred_body_np[i].reshape(H, W)
+        all_illegal.append(0 if is_valid_state(pred_state) else 1)
+
+
+# -------------------------
+# Evaluation 1 — Dataset
+# -------------------------
+def evaluate_with_dataset(model, loader):
     model.eval()
 
-    survival_lengths = []
-    illegal_count = 0
+    acc = {k: [] for k in [
+        "head", "food", "done", "body_tp", "body_fp", "body_fn",
+        "fc_correct", "fc_total", "illegal"
+    ]}
 
-    for _ in range(num_trials):
+    for states, actions, next_states, dones in loader:
+        states = states.to(DEVICE)
+        actions = actions.to(DEVICE)
+        next_states = next_states.to(DEVICE)
+        dones = dones.to(DEVICE)
 
-        idx = random.randint(0, len(test_dataset) - 1)
-        state, action, next_state, done = test_dataset[idx]
+        _accumulate_batch(
+            states, actions, next_states, dones, model,
+            acc["head"], acc["food"], acc["done"],
+            acc["body_tp"], acc["body_fp"], acc["body_fn"],
+            acc["fc_correct"], acc["fc_total"],
+            acc["illegal"],
+        )
 
-        # Convert initial state to numpy (H,W,C)
-        current_state = state.permute(1, 2, 0).cpu().numpy()
-
-        steps_survived = 0
-
-        for _ in range(max_steps):
-
-            action = random.randint(0, 3)
-
-            # ---------- Model prediction ----------
-            state_tensor = torch.tensor(current_state).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
-            action_tensor = torch.tensor([action]).to(DEVICE)
-
-            with torch.no_grad():
-                head_logits, body_logits, food_logits, done_logit = model(state_tensor, action_tensor)
-
-            head_idx = torch.argmax(head_logits, dim=1).item()
-            food_idx = torch.argmax(food_logits, dim=1).item()
-            body_map = (torch.sigmoid(body_logits) > 0.5).float().view(GRID_SIZE, GRID_SIZE).cpu().numpy()
-
-            # Build predicted state (H, W, C)
-            pred_state = np.zeros((GRID_SIZE, GRID_SIZE, 3))
-
-            # Body
-            pred_state[:, :, 0] = body_map
-
-            # Head
-            hx, hy = head_idx % GRID_SIZE, head_idx // GRID_SIZE
-            pred_state[hy, hx, 1] = 1
-
-            # Food
-            fx, fy = food_idx % GRID_SIZE, food_idx // GRID_SIZE
-            pred_state[fy, fx, 2] = 1
-
-            # ---------- Ground truth logical step ----------
-            true_next_state, done_flag = get_next_logical_frame(current_state, action)
-
-            # If logical simulation fails → current state already invalid
-            if true_next_state is None:
-                illegal_count += 1
-                break
-
-            # ---------- Divergence check ----------
-            # Compare predicted vs true next state
-            if not np.array_equal(pred_state, true_next_state):
-                illegal_count += 1
-                break
-
-            # Move forward using predicted state (autoregressive rollout)
-            current_state = pred_state
-            steps_survived += 1
-
-        survival_lengths.append(steps_survived)
-
-    avg_survival = sum(survival_lengths) / len(survival_lengths)
-    illegal_rate = illegal_count / num_trials
-
-    print("\n=== Rollout Evaluation ===")
-    print(f"Average Rollout Length Before Divergence: {avg_survival:.2f}")
-    print(f"Illegal State Rate (Rollout): {illegal_rate:.4f}")
+    total = len(acc["head"])
+    metrics = compute_metrics(
+        acc["head"], acc["food"], acc["done"],
+        acc["body_tp"], acc["body_fp"], acc["body_fn"],
+        acc["fc_correct"], acc["fc_total"],
+        acc["illegal"], total,
+    )
+    print_metrics(metrics, "Dataset Evaluation (held-out test split)")
+    return metrics
 
 
-def multi_step_error_curve(model, test_dataset, num_trials=100, max_steps=20):
+# -------------------------
+# Evaluation 2 — Unseen
+# -------------------------
+def evaluate_unseen(model, n_samples=2000, grid_size=GRID_SIZE):
+    """
+    Generates n_samples random valid Snake states, computes the ground-truth
+    next state with rules_based_next_state, runs the model, and scores it.
+    No data from the training dataset is used.
+    """
     model.eval()
 
-    errors_per_step = [[] for _ in range(max_steps)]
+    acc = {k: [] for k in [
+        "head", "food", "done", "body_tp", "body_fp", "body_fn",
+        "fc_correct", "fc_total", "illegal"
+    ]}
 
-    for _ in range(num_trials):
+    skipped = 0
 
-        idx = random.randint(0, len(test_dataset) - 1)
-        state, _, _, _ = test_dataset[idx]
+    for _ in range(n_samples):
+        try:
+            state_np, _, _ = generate_random_snake_state(grid_size)
+        except RuntimeError:
+            skipped += 1
+            continue
 
-        # Start from real state
-        current_state = state.permute(1, 2, 0).cpu().numpy()
+        action = random.choice(ACTIONS)
+        next_state_np, done = rules_based_next_state(state_np, action, grid_size)
 
-        for step in range(max_steps):
+        # Convert to tensors with batch dim
+        state_t = torch.tensor(state_np).unsqueeze(0).to(DEVICE)
+        next_state_t = torch.tensor(next_state_np).unsqueeze(0).to(DEVICE)
+        action_t = torch.tensor([action], dtype=torch.long).to(DEVICE)
+        done_t = torch.tensor([float(done)]).to(DEVICE)
 
-            action = random.randint(0, 3)
+        _accumulate_batch(
+            state_t, action_t, next_state_t, done_t, model,
+            acc["head"], acc["food"], acc["done"],
+            acc["body_tp"], acc["body_fp"], acc["body_fn"],
+            acc["fc_correct"], acc["fc_total"],
+            acc["illegal"],
+        )
 
-            # ---------- Model prediction ----------
-            state_tensor = torch.tensor(current_state).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
-            action_tensor = torch.tensor([action]).to(DEVICE)
+    if skipped:
+        print(f"  (skipped {skipped} samples due to generation failures)")
 
-            with torch.no_grad():
-                head_logits, body_logits, food_logits, _ = model(state_tensor, action_tensor)
+    total = len(acc["head"])
+    if total == 0:
+        print("  No samples evaluated.")
+        return {}
 
-            head_idx = torch.argmax(head_logits, dim=1).item()
-            body_map = (torch.sigmoid(body_logits) > 0.5).float().view(GRID_SIZE, GRID_SIZE).cpu().numpy()
-
-            pred_state = np.zeros((GRID_SIZE, GRID_SIZE, 3))
-            pred_state[:, :, 0] = body_map
-
-            hx, hy = head_idx % GRID_SIZE, head_idx // GRID_SIZE
-            pred_state[hy, hx, 1] = 1
-
-            # NOTE: ignore food channel completely
-
-            # ---------- Ground truth ----------
-            true_next_state, done_flag = get_next_logical_frame(current_state, action)
-
-            if true_next_state is None:
-                break
-
-            # ---------- Compute error (ignore food channel) ----------
-            pred_no_food = pred_state[:, :, :2]
-            true_no_food = true_next_state[:, :, :2]
-
-            mse = np.mean((pred_no_food - true_no_food) ** 2)
-            errors_per_step[step].append(mse)
-
-            # Move forward using TRUE state (not predicted)
-            current_state = true_next_state
-
-            if done_flag:
-                break
-
-    # ---------- Aggregate ----------
-    avg_errors = []
-    for step_errors in errors_per_step:
-        if len(step_errors) > 0:
-            avg_errors.append(np.mean(step_errors))
-        else:
-            avg_errors.append(0)
-
-    print("\n=== Multi-Step Error Curve ===")
-    for i, e in enumerate(avg_errors):
-        print(f"Step {i + 1}: MSE = {e:.6f}")
-
-    return avg_errors
+    metrics = compute_metrics(
+        acc["head"], acc["food"], acc["done"],
+        acc["body_tp"], acc["body_fp"], acc["body_fn"],
+        acc["fc_correct"], acc["fc_total"],
+        acc["illegal"], total,
+    )
+    print_metrics(metrics, "Unseen State Evaluation (procedurally generated)")
+    return metrics
 
 
-model = TransformerWorldModel().to(DEVICE)
-model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-model.eval()
-dataset = SnakeDataset(DATA_PATH)
+# -------------------------
+# Run All Models
+# -------------------------
+def eval_all_models():
+    models = ["baseline", "transformer", "unet"]
 
-train_size = int(0.9 * len(dataset))
-test_size = len(dataset) - train_size
+    dataset = SnakeDataset(DATA_PATH)
+    train_size = int(0.9 * len(dataset))
+    test_size = len(dataset) - train_size
+    _, test_dataset = random_split(
+        dataset, [train_size, test_size],
+        generator=torch.Generator().manual_seed(42)  # reproducible split
+    )
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    for model_name in models:
+        print("\n" + "=" * 50)
+        print(f"Evaluating: {model_name.upper()}")
+        print("=" * 50)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        model = load_model(model_name, DEVICE)
 
-evaluate(model, test_loader)
-rollout_evaluation(model, test_dataset)
-multi_step_error_curve(model, test_dataset)
+        evaluate_with_dataset(model, test_loader)
+        evaluate_unseen(model, n_samples=2000)
 
-"""
-=== Single-Step Evaluation ===
-Head Accuracy: 0.9998
-Food Position Accuracy: 0.8744
-Done Accuracy: 0.9998
-Body F1 Score: 0.9660
-Food Consumption Accuracy: 0.8730
-Illegal State Rate: 0.0060
 
-=== Rollout Evaluation ===
-Average Rollout Length Before Divergence: 29.80
-Illegal State Rate (Rollout): 0.6100
-"""
+if __name__ == "__main__":
+    eval_all_models()
