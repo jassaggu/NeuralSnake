@@ -8,44 +8,74 @@ CHANNELS = 3  # must match your state encoding
 
 def reconstruct_snake(body_positions, head):
     """
-    Reconstruct ordered snake from unordered body cells.
-    Returns list from tail -> head.
+    Reconstruct an ordered snake list from unordered body cells and a known head.
+    Returns list ordered tail -> head, or None if reconstruction fails.
+
+    Fix over the original greedy approach: instead of walking from the head and
+    greedily picking any neighbour (which fails on coiled snakes where a cell
+    has multiple body neighbours), we first locate the tail — the unique body
+    cell with exactly one snake-neighbour — then walk the chain from tail to
+    head. At every interior cell there is exactly one unvisited neighbour, so
+    the walk is unambiguous regardless of snake shape.
+
+    Edge case: length-1 snake (head only, no body cells) returns [head].
     """
+    if len(body_positions) == 0:
+        return [head]
+
     body_set = set(body_positions)
-    snake = [head]
+    all_cells = body_set | {head}
 
-    current = head
+    def neighbours(pos):
+        x, y = pos
+        return [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
 
-    while True:
-        x, y = current
+    def snake_neighbours(pos):
+        return [n for n in neighbours(pos) if n in all_cells]
 
-        neighbours = [
-            (x + 1, y),
-            (x - 1, y),
-            (x, y + 1),
-            (x, y - 1)
-        ]
-
-        next_cell = None
-        for n in neighbours:
-            if n in body_set:
-                next_cell = n
-                break
-
-        if next_cell is None:
+    # Find the tail: the body cell with exactly one snake-neighbour.
+    # (The head also has one neighbour when the snake is length 2, so we
+    # restrict the search to body cells only.)
+    tail = None
+    for cell in body_set:
+        if len(snake_neighbours(cell)) == 1:
+            tail = cell
             break
 
-        snake.append(next_cell)
-        body_set.remove(next_cell)
-        current = next_cell
+    # Fallback: if no tail found (e.g. snake forms a loop due to bad state),
+    # just pick an arbitrary body cell — reconstruction may still fail the
+    # safety check below, which is the correct behaviour.
+    if tail is None:
+        tail = next(iter(body_set))
 
-    snake.reverse()  # tail -> head
+    # Walk from tail to head
+    snake = [tail]
+    visited = {tail}
 
-    # Optional safety check
+    while True:
+        current = snake[-1]
+        unvisited = [n for n in snake_neighbours(current) if n not in visited]
+
+        if not unvisited:
+            break
+
+        # There should be exactly one unvisited neighbour at every step
+        # (two only at the tail, but we've already visited that direction).
+        nxt = unvisited[0]
+        snake.append(nxt)
+        visited.add(nxt)
+
+    # Safety check: reconstructed chain must contain all body cells + head
     if len(snake) != len(body_positions) + 1:
         return None
 
-    return snake
+    # Ensure head is last (tail -> head order)
+    if snake[-1] != head:
+        snake.reverse()
+        if snake[-1] != head:
+            return None
+
+    return snake  # tail -> head
 
 
 def get_next_logical_frame(state, action):
