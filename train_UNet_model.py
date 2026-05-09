@@ -223,6 +223,6 @@ if __name__ == "__main__":
 
         print(f"Epoch {epoch + 1}/{EPOCHS} | Loss: {total_loss / len(loader):.4f}")
 
-        torch.save(model.state_dict(), "unet_world_model.pt")
+        torch.save(model.state_dict(), "model_weights/unet_world_model.pt")
 
     print("Training complete.")

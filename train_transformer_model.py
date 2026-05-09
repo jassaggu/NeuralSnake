@@ -17,7 +17,7 @@ LR = 3e-4
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 DATA_PATH = "snake_transitions.npz"
-MODEL_PATH = "transformer_world_model.pt"
+MODEL_PATH = "model_weights/transformer_world_model.pt"
 
 
 # Dataset

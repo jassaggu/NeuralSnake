@@ -153,7 +153,7 @@ if __name__ == "__main__":
         avg_loss = total_train_loss / len(train_loader)
         print(f"Epoch {epoch:02d} | Train Loss: {avg_loss:.4f}")
         if avg_loss < best_loss:
-            torch.save(model.state_dict(), "baseline_cnn_world_model.pt")
+            torch.save(model.state_dict(), "model_weights/baseline_cnn_world_model.pt")
             print("Loss improved, model saved.")
 
     print("Training complete. Model saved.")
