@@ -8,13 +8,13 @@ from train_baseline_model import BaselineCNNModel
 def load_model(model_name, device):
     if model_name == "transformer":
         model = TransformerWorldModel()
-        model.load_state_dict(torch.load("transformer_world_model.pt", map_location=device))
+        model.load_state_dict(torch.load("model_weights/transformer_world_model.pt", map_location=device))
     elif model_name == "unet":
         model = ResidualUNetWorldModel()
-        model.load_state_dict(torch.load("unet_world_model.pt", map_location=device))
+        model.load_state_dict(torch.load("model_weights/unet_world_model.pt", map_location=device))
     elif model_name == "baseline":
         model = BaselineCNNModel()
-        model.load_state_dict(torch.load("baseline_cnn_world_model.pt", map_location=device))
+        model.load_state_dict(torch.load("model_weights/baseline_cnn_world_model.pt", map_location=device))
     else:
         raise Exception("Model incorrectly set")
 

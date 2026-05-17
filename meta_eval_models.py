@@ -1,41 +1,11 @@
-"""
-meta_eval_model.py
-==================
-Game-agnostic evaluation of the neural Snake world model.
-
-Metrics are framed to be applicable to any neural world model, not Snake
-specifically. All three metrics are computed over paired rollouts — the same
-starting state and action sequence is run through both the model and the
-ground-truth simulator, and the results are compared.
-
-Metrics
--------
-1. Survival Reward
-   +1 for each rollout step where the predicted state has IoU >= threshold
-   against the ground-truth next state. Measures how long the model produces
-   correct next states before diverging. Reported as mean cumulative survival
-   reward across all rollouts, and as a survival reward curve (mean per step).
-
-2. Event Detection F1
-   Binary F1 on whether the model correctly detects discrete reward events
-   (food eaten in Snake; generalises to any game event). Positive class =
-   event occurred this step. Accumulates TP/FP/FN across all rollout steps.
-
-3. Termination F1
-   Binary F1 on whether the model correctly predicts episode termination.
-   Positive class = episode ends this step. Ground truth is the simulator
-   done flag; prediction is the model's done head output.
-"""
-
 import numpy as np
 import torch
 import random
 
 from select_model import load_model
-from eval_tools import generate_random_snake_state, get_next_logical_frame
-from eval_model import (
-    is_valid_state, flatten_logits, _decode_model_output, _biased_action,
-    rules_based_next_state,
+from eval_tools import generate_random_snake_state, get_next_logical_frame, flatten_logits
+from eval_models import (
+    is_valid_state, _decode_model_output, _biased_action,
     GRID_SIZE, DEVICE, ACTIONS,
     ROLLOUT_N, ROLLOUT_MAX_STEPS, ROLLOUT_MIN_SNAKE_LENGTH,
     ROLLOUT_DIVERGENCE_STEPS, ROLLOUT_P_STRAIGHT,
@@ -45,15 +15,8 @@ from eval_model import (
 SURVIVAL_IOU_THRESHOLD = 0.9
 
 
-# -------------------------
-# IoU helper
-# -------------------------
+# Mean IoU across channels
 def _state_iou_all_channels(pred_chw, gt_hwc, ate_food):
-    """
-    Mean IoU across channels. Food channel excluded on eating steps
-    since food respawn is stochastic.
-    pred_chw : (C, H, W)  |  gt_hwc : (H, W, C)
-    """
     channels = [0, 1] if ate_food else [0, 1, 2]
     ious = []
     for c in channels:
@@ -65,9 +28,7 @@ def _state_iou_all_channels(pred_chw, gt_hwc, ate_food):
     return float(np.mean(ious))
 
 
-# -------------------------
 # Meta Evaluation
-# -------------------------
 def meta_evaluate(
         model,
         model_name="model",
@@ -78,29 +39,12 @@ def meta_evaluate(
         dataset=None,
         seed=42,
 ):
-    """
-    Runs paired rollouts and computes the three meta metrics.
-
-    Starting states are sampled from the dataset when grid_size matches the
-    training size and a dataset is provided; otherwise generated procedurally.
-
-    Args:
-        model           : loaded, eval-mode model
-        model_name      : string label for printing
-        n_rollouts      : number of rollouts to run
-        max_steps       : maximum steps per rollout
-        min_snake_length: minimum snake length for starting states
-        grid_size       : grid size for state generation / decoding
-        dataset         : optional RolloutDataset (states, actions arrays)
-        seed            : random seed for reproducibility
-    """
     model.eval()
     rng = np.random.default_rng(seed)
     py_rng = random.Random(seed)
 
     use_dataset = (grid_size == GRID_SIZE) and (dataset is not None)
 
-    # --- Build starting-state provider ---
     if use_dataset:
         valid_indices = []
         for idx in range(len(dataset)):
@@ -115,7 +59,7 @@ def meta_evaluate(
                 valid_indices.append(idx)
 
         if len(valid_indices) < n_rollouts:
-            print(f"  Warning: only {len(valid_indices)} valid starting states, "
+            print(f"Warning: only {len(valid_indices)} valid starting states, "
                   f"requested {n_rollouts}.")
             n_rollouts = len(valid_indices)
 
@@ -130,7 +74,7 @@ def meta_evaluate(
             state_chw, _, _ = generate_random_snake_state(grid_size)
             return state_chw.transpose(1, 2, 0), random.choice(ACTIONS)
 
-    # --- Accumulators ---
+    # Accumulators
     # Survival reward
     all_cumulative_survival = []  # one scalar per rollout
     step_survival = {s: [] for s in ROLLOUT_DIVERGENCE_STEPS}
@@ -141,18 +85,15 @@ def meta_evaluate(
     # Termination F1
     term_tp = term_fp = term_fn = 0
 
-    # --- Rollout loop ---
+    # Rollout loop
     for i in range(n_rollouts):
         gt_state_hwc, current_action = get_start(i)
-        model_state_chw = torch.tensor(
-            gt_state_hwc.transpose(2, 0, 1)
-        ).float()
+        model_state_chw = torch.tensor(gt_state_hwc.transpose(2, 0, 1)).float()
 
         cumulative_survival = 0.0
 
         for step in range(1, max_steps + 1):
-            action = (_biased_action(current_action, py_rng)
-                      if step > 1 else current_action)
+            action = (_biased_action(current_action, py_rng) if step > 1 else current_action)
             current_action = action
 
             # Ground truth step
@@ -181,14 +122,14 @@ def meta_evaluate(
             )
             pred_done = (torch.sigmoid(done_logit).item() > 0.5)
 
-            # ---- Survival reward ----
+            # Survival reward
             iou = _state_iou_all_channels(pred_chw, gt_next_hwc, gt_event)
             survived = float(iou >= SURVIVAL_IOU_THRESHOLD)
             cumulative_survival += survived
             if step in step_survival:
                 step_survival[step].append(survived)
 
-            # ---- Event detection F1 ----
+            # Event detection F1
             # Predicted event: model predicts head on current food cell
             prev_food_flat = torch.tensor(
                 gt_state_hwc[:, :, 2], dtype=torch.float32
@@ -205,7 +146,7 @@ def meta_evaluate(
             elif gt_event and not pred_event:
                 ed_fn += 1
 
-            # ---- Termination F1 ----
+            # Termination F1
             if gt_done and pred_done:
                 term_tp += 1
             elif not gt_done and pred_done:
@@ -213,7 +154,7 @@ def meta_evaluate(
             elif gt_done and not pred_done:
                 term_fn += 1
 
-            # Advance
+            # Ground truth moves forward, model feeds its own prediction
             gt_state_hwc = gt_next_hwc
             model_state_chw = torch.tensor(pred_chw).float()
 
@@ -222,24 +163,41 @@ def meta_evaluate(
 
         all_cumulative_survival.append(cumulative_survival)
 
-    # --- Compute final metrics ---
+    # Compute final metrics
 
     # Survival reward
     mean_survival = float(np.mean(all_cumulative_survival))
     max_possible = max_steps  # theoretical ceiling
 
     # Event detection F1
-    ed_prec = ed_tp / (ed_tp + ed_fp) if (ed_tp + ed_fp) > 0 else 0.0
-    ed_rec = ed_tp / (ed_tp + ed_fn) if (ed_tp + ed_fn) > 0 else 0.0
-    ed_f1 = (2 * ed_prec * ed_rec / (ed_prec + ed_rec)
-             if (ed_prec + ed_rec) > 0 else 0.0)
+    if (ed_tp + ed_fp) > 0:
+        ed_prec = ed_tp / (ed_tp + ed_fp)
+    else:
+        ed_prec = 0.0
+    if (ed_tp + ed_fn) > 0:
+        ed_rec = ed_tp / (ed_tp + ed_fn)
+    else:
+        ed_rec = 0.0
+    if (ed_prec + ed_rec) > 0:
+        ed_f1 = 2 * ed_prec * ed_rec / (ed_prec + ed_rec)
+    else:
+        ed_f1 = 0.0
     ed_support = ed_tp + ed_fn
 
     # Termination F1
-    term_prec = term_tp / (term_tp + term_fp) if (term_tp + term_fp) > 0 else 0.0
-    term_rec = term_tp / (term_tp + term_fn) if (term_tp + term_fn) > 0 else 0.0
-    term_f1 = (2 * term_prec * term_rec / (term_prec + term_rec)
-               if (term_prec + term_rec) > 0 else 0.0)
+    if (term_tp + term_fp) > 0:
+        term_prec = term_tp / (term_tp + term_fp)
+    else:
+        term_prec = 0.0
+    if (term_tp + term_fn) > 0:
+        term_rec = term_tp / (term_tp + term_fn)
+    else:
+        term_rec = 0.0
+    if (term_prec + term_rec) > 0:
+        term_f1 = 2 * term_prec * term_rec / (term_prec + term_rec)
+    else:
+        term_f1 = 0.0
+
     term_support = term_tp + term_fn
 
     metrics = {
@@ -257,8 +215,8 @@ def meta_evaluate(
         "termination_rec": term_rec,
         "termination_support": term_support,
     }
-
     _print_meta_metrics(metrics, model_name, grid_size, n_rollouts, max_steps)
+
     return metrics
 
 
@@ -288,12 +246,10 @@ def _print_meta_metrics(metrics, model_name, grid_size, n_rollouts, max_steps):
     print(f"  Recall:    {metrics['termination_rec']:.4f}")
 
 
-# -------------------------
-# Run All Models
-# -------------------------
+# Run all models
 def meta_eval_all_models():
     from torch.utils.data import random_split
-    from eval_model import SnakeDataset, BATCH_SIZE
+    from eval_models import SnakeDataset, BATCH_SIZE
     from torch.utils.data import DataLoader
 
     models = ["baseline", "transformer", "unet"]

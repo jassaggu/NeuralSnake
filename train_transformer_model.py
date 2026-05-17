@@ -83,9 +83,7 @@ class TransformerWorldModel(nn.Module):
         state = state.permute(0, 2, 1)
 
         cell_tokens = self.cell_embed(state)
-
         action_token = self.action_embed(action).unsqueeze(1)
-
         tokens = torch.cat([action_token, cell_tokens], dim=1)
         tokens = tokens + self.pos_embedding
 
@@ -97,31 +95,25 @@ class TransformerWorldModel(nn.Module):
         head_logits = self.head_out(grid_tokens).squeeze(-1)
         body_logits = self.body_out(grid_tokens).squeeze(-1)
         food_logits = self.food_out(grid_tokens).squeeze(-1)
-
         done_logit = self.done_out(action_context).squeeze(-1)
 
         return head_logits, body_logits, food_logits, done_logit
 
 
-# Helper: find tail cell
+# Helper to find tail cell
 def find_tail_mask(body, head):
-    """
-    body: (B,100)
-    head: (B,100)
-    returns tail mask (B,100)
-    """
     B = body.size(0)
 
     body_grid = body.reshape(B, GRID_SIZE, GRID_SIZE)
     head_grid = head.reshape(B, GRID_SIZE, GRID_SIZE)
 
-    padded = F.pad(body_grid, (1,1,1,1))
+    padded = F.pad(body_grid, (1, 1, 1, 1))
 
     neighbours = (
-        padded[:, :-2, 1:-1] +
-        padded[:, 2:, 1:-1] +
-        padded[:, 1:-1, :-2] +
-        padded[:, 1:-1, 2:]
+            padded[:, :-2, 1:-1] +
+            padded[:, 2:, 1:-1] +
+            padded[:, 1:-1, :-2] +
+            padded[:, 1:-1, 2:]
     )
 
     tail = (body_grid == 1) & (neighbours == 1) & (head_grid == 0)
@@ -146,7 +138,6 @@ def train():
         total_loss = 0
 
         for state, action, next_state, done in loader:
-
             state = state.to(DEVICE)
             action = action.to(DEVICE)
             next_state = next_state.to(DEVICE)
@@ -154,9 +145,9 @@ def train():
 
             head_logits, body_logits, food_logits, done_logit = model(state, action)
 
-            next_body = next_state[:,0].reshape(-1, NUM_CELLS)
-            next_head = next_state[:,1].reshape(-1, NUM_CELLS)
-            next_food = next_state[:,2].reshape(-1, NUM_CELLS)
+            next_body = next_state[:, 0].reshape(-1, NUM_CELLS)
+            next_head = next_state[:, 1].reshape(-1, NUM_CELLS)
+            next_food = next_state[:, 2].reshape(-1, NUM_CELLS)
 
             head_target = torch.argmax(next_head, dim=1)
             food_target = torch.argmax(next_food, dim=1)
@@ -164,13 +155,7 @@ def train():
             # Standard losses
             head_loss = F.cross_entropy(head_logits, head_target)
             food_loss = F.cross_entropy(food_logits, food_target)
-
-            body_loss = F.binary_cross_entropy_with_logits(
-                body_logits,
-                next_body,
-                pos_weight=pos_weight
-            )
-
+            body_loss = F.binary_cross_entropy_with_logits(body_logits, next_body, pos_weight=pos_weight)
             done_loss = F.binary_cross_entropy_with_logits(done_logit, done)
 
             # Body size regularisation
@@ -180,28 +165,23 @@ def train():
 
             size_loss = F.mse_loss(pred_body_sum, true_body_sum)
 
-            # ---------- Tail dynamics loss ----------
-
-            prev_body = state[:,0].reshape(-1, NUM_CELLS)
-            prev_head = state[:,1].reshape(-1, NUM_CELLS)
+            # Tail dynamic loss
+            prev_body = state[:, 0].reshape(-1, NUM_CELLS)
+            prev_head = state[:, 1].reshape(-1, NUM_CELLS)
 
             tail_mask = find_tail_mask(prev_body, prev_head).to(DEVICE)
-
             tail_prob = (pred_body_prob * tail_mask).sum(dim=1)
-
             food_eaten = (true_body_sum > prev_body.sum(dim=1)).float()
-
             tail_loss = ((1 - food_eaten) * tail_prob).mean()
 
-            # ---------- Final loss ----------
-
+            # Final loss
             loss = (
-                head_loss
-                + food_loss
-                + 2.0 * body_loss
-                + done_loss
-                + 0.1 * size_loss
-                + 0.5 * tail_loss
+                    head_loss
+                    + food_loss
+                    + 2 * body_loss
+                    + done_loss
+                    + 0.1 * size_loss
+                    + 0.5 * tail_loss
             )
 
             optimizer.zero_grad()
@@ -213,7 +193,6 @@ def train():
         avg_loss = total_loss / len(loader)
 
         print(f"Epoch {epoch + 1}/{EPOCHS} | Loss: {avg_loss:.4f}")
-
         if avg_loss < best_loss:
             best_loss = avg_loss
             torch.save(model.state_dict(), MODEL_PATH)

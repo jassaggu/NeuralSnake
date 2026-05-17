@@ -1,9 +1,9 @@
 import pygame
 import numpy as np
 
-# -------------------
+pygame.init()
+
 # Config
-# -------------------
 GRID_SIZE = 10
 CELL_SIZE = 20
 CHANNELS = 3
@@ -16,14 +16,13 @@ LEFT = 2
 RIGHT = 3
 ACTIONS = [UP, DOWN, LEFT, RIGHT]
 
-pygame.init()
 
-
-# -------------------
-# Snake Game
-# -------------------
 class SnakeGame:
     def __init__(self, grid_size):
+        self.snake = None
+        self.direction = None
+        self.food = None
+        self.done = None
         self.grid_size = grid_size
         self.reset()
 
@@ -33,10 +32,10 @@ class SnakeGame:
         self.food = self.spawn_food()
         self.done = False
 
+    # Random location that isn't a snake cell
     def spawn_food(self):
         while True:
-            pos = (np.random.randint(self.grid_size),
-                   np.random.randint(self.grid_size))
+            pos = (np.random.randint(self.grid_size), np.random.randint(self.grid_size))
             if pos not in self.snake:
                 return pos
 
@@ -54,6 +53,7 @@ class SnakeGame:
 
         return state
 
+    # Outside the grid or in the Snake
     def is_collision(self, pos):
         x, y = pos
         if x < 0 or x >= self.grid_size:
@@ -62,14 +62,16 @@ class SnakeGame:
             return True
         if pos in self.snake:
             return True
+
         return False
 
+    # Apply action to state
     def step(self, action):
+        # Termination
         if self.done:
             return self.get_state(), True
 
         head_x, head_y = self.snake[-1]
-
         if action == UP:
             head_y -= 1
         elif action == DOWN:
@@ -83,6 +85,7 @@ class SnakeGame:
 
         if self.is_collision(new_head):
             self.done = True
+
             return self.get_state(), True
 
         self.snake.append(new_head)
@@ -95,9 +98,7 @@ class SnakeGame:
         return self.get_state(), False
 
 
-# -------------------
-# Smarter Policy
-# -------------------
+# Chooses a safe movement that greedily minimises distance to food
 def choose_smart_action(game):
     head_x, head_y = game.snake[-1]
     food_x, food_y = game.food
@@ -109,7 +110,6 @@ def choose_smart_action(game):
 
     for action in ACTIONS:
         x, y = head_x, head_y
-
         if action == UP:
             y -= 1
         elif action == DOWN:
@@ -138,11 +138,8 @@ def choose_smart_action(game):
     return np.random.choice(ACTIONS)
 
 
-# -------------------
-# Data Collection
-# -------------------
+# Data collection
 def generate_dataset(dataset_size=DATASET_SIZE):
-
     game = SnakeGame(GRID_SIZE)
 
     states = []
@@ -164,8 +161,9 @@ def generate_dataset(dataset_size=DATASET_SIZE):
         if done:
             game.reset()
 
+        # Update every 5000 transitions
         if len(states) % 5000 == 0:
-            print(f"Collected {len(states)} transitions")
+            print(f"Generated {len(states)} transitions")
 
     np.savez_compressed(
         OUTPUT_FILE,
@@ -174,8 +172,7 @@ def generate_dataset(dataset_size=DATASET_SIZE):
         next_states=np.array(next_states),
         dones=np.array(dones)
     )
-
-    print(f"\nDataset saved to {OUTPUT_FILE}")
+    print(f"Dataset saved to {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":

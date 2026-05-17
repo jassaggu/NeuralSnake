@@ -7,16 +7,19 @@ from select_model import load_model
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 # Config
-MODEL = "unet"      # baseline, unet, transformer
-GRID_SIZE = 100      # change this freely now
+MODEL = "unet"  # Options: baseline, unet, transformer
+GRID_SIZE = 40  # Change this from 10 to qualitatively test generalisability
 CELL_SIZE = 10
 WINDOW_SIZE = GRID_SIZE * CELL_SIZE
+BODY_COLOUR = (0, 150, 0)
+HEAD_COLOUR = (0, 255, 0)
+FOOD_COLOUR = (255, 0, 0)
 
 model = load_model(MODEL, device)
 
 pygame.init()
 screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
-pygame.display.set_caption("Learned Snake (Neural World Model)")
+pygame.display.set_caption("Neural Snake (model predictions)")
 clock = pygame.time.Clock()
 
 
@@ -24,6 +27,8 @@ clock = pygame.time.Clock()
 # channel 1 = head
 # channel 2 = food
 
+
+# Places head at centre and randomly positions food cell
 def create_initial_state():
     state = np.zeros((3, GRID_SIZE, GRID_SIZE), dtype=np.float32)
 
@@ -49,22 +54,20 @@ def draw_board(state):
     food = state[2]
 
     H, W = body.shape
-
     for i in range(H):
         for j in range(W):
             rect = pygame.Rect(j * CELL_SIZE, i * CELL_SIZE, CELL_SIZE, CELL_SIZE)
 
             if body[i, j] > 0.1:
-                pygame.draw.rect(screen, (0, 150, 0), rect)
+                pygame.draw.rect(screen, BODY_COLOUR, rect)
 
             if head[i, j] > 0.5:
-                pygame.draw.rect(screen, (0, 255, 0), rect)
+                pygame.draw.rect(screen, HEAD_COLOUR, rect)
 
             if food[i, j] > 0.5:
-                pygame.draw.rect(screen, (255, 0, 0), rect)
+                pygame.draw.rect(screen, FOOD_COLOUR, rect)
 
             pygame.draw.rect(screen, (40, 40, 40), rect, 1)
-
     pygame.display.flip()
 
 
@@ -80,8 +83,9 @@ def get_action_from_key(key):
     return None
 
 
+# Convert logits to a Snake game state
 def reconstruct_state(head_logits, body_logits, food_logits):
-    # ---- Handle both flattened and spatial outputs ----
+    # For compatibility between models
     if head_logits.dim() == 4:
         # (B, 1, H, W) → (B, N)
         B, _, H, W = head_logits.shape
@@ -98,20 +102,20 @@ def reconstruct_state(head_logits, body_logits, food_logits):
     else:
         raise ValueError(f"Unexpected logits shape: {head_logits.shape}")
 
-    # ---- HEAD ----
+    # Head
     head_idx = torch.argmax(head_logits, dim=1)
     head_map = torch.zeros((B, N), device=device)
     head_map[torch.arange(B), head_idx] = 1.0
 
-    # ---- BODY ----
+    # Body
     body_map = (torch.sigmoid(body_logits) > 0.5).float()
 
-    # ---- FOOD ----
+    # Food
     food_idx = torch.argmax(food_logits, dim=1)
     food_map = torch.zeros((B, N), device=device)
     food_map[torch.arange(B), food_idx] = 1.0
 
-    # ---- Reconstruct grid ----
+    # Reconstruct the grid
     next_state = torch.stack([
         body_map.view(B, H, W),
         head_map.view(B, H, W),
@@ -126,7 +130,7 @@ action = 0
 running = True
 
 while running:
-    clock.tick(6)
+    clock.tick(5)  # Change this to change game speed
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -143,7 +147,17 @@ while running:
     with torch.no_grad():
         head_logits, body_logits, food_logits, done_logit = model(state_tensor, action_tensor)
 
-    # termination
+    # Convert logits to body map
+    if body_logits.dim() == 4:  # (B,1,H,W)
+        body_map = (torch.sigmoid(body_logits) > 0.5).float()
+        num_body_cells = body_map.sum(dim=(1, 2, 3))    # Per batch
+    else:
+        body_map = (torch.sigmoid(body_logits) > 0.5).float()
+        num_body_cells = body_map.sum(dim=1)
+
+    print("Body cells:", num_body_cells.item())
+
+    # Termination probability
     done_prob = torch.sigmoid(done_logit)
     done_pred = (done_prob > 0.5).item()
 
@@ -158,5 +172,4 @@ while running:
     current_state = next_state.squeeze(0).cpu().numpy()
 
     draw_board(current_state)
-
 pygame.quit()

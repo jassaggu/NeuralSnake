@@ -21,7 +21,7 @@ ROLLOUT_DIVERGENCE_STEPS = [1, 5, 10, 20, 30, 50]
 ROLLOUT_MAX_STEPS = 50
 ROLLOUT_N = 100
 ROLLOUT_MIN_SNAKE_LENGTH = 4
-ROLLOUT_P_STRAIGHT = 0.6  # Pro
+ROLLOUT_P_STRAIGHT = 0.6    # Probability to encourage generation of less congested snakes
 ROLLOUT_DIVERGENCE_THRESHOLD = 0.9
 
 
@@ -46,13 +46,11 @@ class SnakeDataset(Dataset):
         return state, action, next_state, done
 
 
-# State Validity Check
+# Checks whether a state represents a legal Snake game state:
+# Exactly one head and food cell
+# No overlap between any pair of channels
+# All body cells connected to head
 def is_valid_state(state_tensor):
-    # Checks whether a state represents a legal Snake game state:
-    # Exactly one head and food cell
-    # No overlap between any pair of channels
-    # All body cells connected to head
-
     if isinstance(state_tensor, torch.Tensor):
         state = state_tensor.cpu().numpy()
     else:
@@ -326,7 +324,7 @@ def evaluate_with_dataset(model, loader, grid_size=GRID_SIZE):
         acc["food_respawn_correct"], acc["food_respawn_total"],
         acc["illegal"], total,
     )
-    print_metrics(metrics, f"Dataset Evaluation (grid={grid_size}, held-out test split)")
+    print_metrics(metrics, f"Dataset Evaluation (grid={grid_size}, in-distribution)")
     return metrics
 
 
@@ -391,7 +389,6 @@ def evaluate_unseen(model, n_samples=2000, grid_size=GRID_SIZE):
 
 
 # Rollout Helpers
-
 # Choose next action with bias for going straight to prevent overcongestion, uses ROLLOUT_P_STRAIGHT
 def _biased_action(current_action, rng):
     opposite = {UP: DOWN, DOWN: UP, LEFT: RIGHT, RIGHT: LEFT}
@@ -578,20 +575,11 @@ def eval_all_models():
     models = ["baseline", "transformer", "unet"]
 
     dataset = SnakeDataset(DATA_PATH)
-    train_size = int(0.9 * len(dataset))
-    test_size = len(dataset) - train_size
-    _, test_dataset = random_split(
-        dataset, [train_size, test_size],
-        generator=torch.Generator().manual_seed(42),
-    )
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    # Get raw arrays for rollout
-    raw = test_dataset.dataset
-    indices = test_dataset.indices
     rollout_ds = type("RolloutDataset", (), {
-        "states": raw.states[indices],
-        "actions": raw.actions[indices],
+        "states": dataset.states,
+        "actions": dataset.actions,
         "__len__": lambda self: len(self.states),
     })()
 
@@ -602,7 +590,7 @@ def eval_all_models():
 
         model = load_model(model_name, DEVICE)
 
-        evaluate_with_dataset(model, test_loader, grid_size=GRID_SIZE)
+        evaluate_with_dataset(model, loader, grid_size=GRID_SIZE)
         evaluate_unseen(model, n_samples=2000, grid_size=GRID_SIZE)
         evaluate_rollout(model, rollout_ds, grid_size=GRID_SIZE)
 

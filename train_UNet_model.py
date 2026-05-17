@@ -5,9 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
 
-# -------------------------
-# Residual Block (GroupNorm)
-# -------------------------
+# Residual Block
 class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -23,9 +21,7 @@ class ResBlock(nn.Module):
         return F.relu(out + identity)
 
 
-# -------------------------
 # Downsample
-# -------------------------
 class DownBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -38,9 +34,7 @@ class DownBlock(nn.Module):
         return self.res(x)
 
 
-# -------------------------
 # Upsample
-# -------------------------
 class UpBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -55,9 +49,7 @@ class UpBlock(nn.Module):
         return self.res(x)
 
 
-# -------------------------
 # FiLM
-# -------------------------
 class FiLM(nn.Module):
     def __init__(self, num_actions, channels):
         super().__init__()
@@ -71,20 +63,15 @@ class FiLM(nn.Module):
         return gamma * x + beta
 
 
-# -------------------------
-# World Model (FIXED)
-# -------------------------
+# Proposed model: Residual U-Net model
 class ResidualUNetWorldModel(nn.Module):
     def __init__(self, num_actions=4):
         super().__init__()
 
         self.input_conv = nn.Conv2d(3, 32, 3, padding=1)
         self.res1 = ResBlock(32)
-
         self.down1 = DownBlock(32, 64)
-
         self.film = FiLM(num_actions, 64)
-
         self.up1 = UpBlock(64, 32)
 
         self.head_out = nn.Conv2d(32, 1, 1)
@@ -100,25 +87,20 @@ class ResidualUNetWorldModel(nn.Module):
     def forward(self, state, action):
         x1 = F.relu(self.input_conv(state))
         x1 = self.res1(x1)
-
         x2 = self.down1(x1)
         x2 = self.film(x2, action)
 
         x = self.up1(x2, x1)
 
-        # ✅ KEEP SPATIAL SHAPE (B,1,H,W)
         head_logits = self.head_out(x)
         body_logits = self.body_out(x)
         food_logits = self.food_out(x)
-
         done_logit = self.done_head(x).squeeze(-1)
 
         return head_logits, body_logits, food_logits, done_logit
 
 
-# -------------------------
 # Dataset
-# -------------------------
 class SnakeDataset(Dataset):
     def __init__(self, path):
         data = np.load(path)
@@ -139,11 +121,10 @@ class SnakeDataset(Dataset):
         return state, action, next_state, done
 
 
-# -------------------------
-# Training (UPDATED)
-# -------------------------
+# Training loop
 if __name__ == "__main__":
     DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    # Hyperparameters
     BATCH_SIZE = 64
     EPOCHS = 20
     LR = 1e-3
@@ -157,6 +138,7 @@ if __name__ == "__main__":
 
     pos_weight_body = torch.tensor([5.0]).to(DEVICE)
 
+    print("Starting training...")
     for epoch in range(EPOCHS):
         total_loss = 0
         model.train()
@@ -169,14 +151,14 @@ if __name__ == "__main__":
 
             head_logits, body_logits, food_logits, done_logit = model(states, actions)
 
-            B, _, H, W = states.shape  # ✅ dynamic size
+            B, _, H, W = states.shape
 
-            # -------- Flatten dynamically --------
+            # Flatten logits
             head_logits_flat = head_logits.view(B, -1)
             food_logits_flat = food_logits.view(B, -1)
             body_logits_flat = body_logits.view(B, -1)
 
-            # -------- Targets --------
+            # Ground truth targets
             target_head = next_states[:, 1].view(B, -1)
             head_target_idx = target_head.argmax(dim=1)
 
@@ -185,17 +167,13 @@ if __name__ == "__main__":
 
             target_body = next_states[:, 0].view(B, -1)
 
-            # -------- Losses --------
+            # Losses
             loss_head = F.cross_entropy(head_logits_flat, head_target_idx)
             loss_food = F.cross_entropy(food_logits_flat, food_target_idx)
-
-            loss_body = F.binary_cross_entropy_with_logits(
-                body_logits_flat, target_body, pos_weight=pos_weight_body
-            )
-
+            loss_body = F.binary_cross_entropy_with_logits(body_logits_flat, target_body, pos_weight=pos_weight_body)
             loss_done = F.binary_cross_entropy_with_logits(done_logit, dones)
 
-            # -------- Movement Penalty (dynamic) --------
+            # Movement penalty
             prev_head = states[:, 1].view(B, -1)
             prev_head_idx = prev_head.argmax(dim=1)
             pred_head_idx = head_logits_flat.argmax(dim=1)
@@ -206,7 +184,7 @@ if __name__ == "__main__":
             movement_dist = torch.abs(prev_x - pred_x) + torch.abs(prev_y - pred_y)
             movement_penalty = torch.mean((movement_dist - 1).clamp(min=0).float())
 
-            # -------- Total Loss --------
+            # Total loss
             loss = (
                     2.0 * loss_head
                     + 0.5 * loss_body
@@ -222,7 +200,6 @@ if __name__ == "__main__":
             total_loss += loss.item()
 
         print(f"Epoch {epoch + 1}/{EPOCHS} | Loss: {total_loss / len(loader):.4f}")
-
         torch.save(model.state_dict(), "model_weights/unet_world_model.pt")
 
     print("Training complete.")

@@ -1,25 +1,20 @@
 # eval_tools.py
+from collections import deque
+
 import numpy as np
-from generate_truth_dataset import SnakeGame, GRID_SIZE, UP, DOWN, LEFT, RIGHT, ACTIONS
+
+from generate_truth_dataset import UP, DOWN, LEFT, RIGHT
 import random
 
-CHANNELS = 3  # must match your state encoding
+CHANNELS = 3
+GRID_SIZE = 10
+
+UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
+ACTIONS = [UP, DOWN, LEFT, RIGHT]
 
 
+# Reconstructs snake from unordered set of body cells and a head position, works on all snake shapes
 def reconstruct_snake(body_positions, head):
-    """
-    Reconstruct an ordered snake list from unordered body cells and a known head.
-    Returns list ordered tail -> head, or None if reconstruction fails.
-
-    Fix over the original greedy approach: instead of walking from the head and
-    greedily picking any neighbour (which fails on coiled snakes where a cell
-    has multiple body neighbours), we first locate the tail — the unique body
-    cell with exactly one snake-neighbour — then walk the chain from tail to
-    head. At every interior cell there is exactly one unvisited neighbour, so
-    the walk is unambiguous regardless of snake shape.
-
-    Edge case: length-1 snake (head only, no body cells) returns [head].
-    """
     if len(body_positions) == 0:
         return [head]
 
@@ -33,22 +28,17 @@ def reconstruct_snake(body_positions, head):
     def snake_neighbours(pos):
         return [n for n in neighbours(pos) if n in all_cells]
 
-    # Find the tail: the body cell with exactly one snake-neighbour.
-    # (The head also has one neighbour when the snake is length 2, so we
-    # restrict the search to body cells only.)
+    # Find the tail
     tail = None
     for cell in body_set:
         if len(snake_neighbours(cell)) == 1:
             tail = cell
             break
 
-    # Fallback: if no tail found (e.g. snake forms a loop due to bad state),
-    # just pick an arbitrary body cell — reconstruction may still fail the
-    # safety check below, which is the correct behaviour.
+    # If no tail is found, pick an arbitrary body cell (in case of bad state)
     if tail is None:
         tail = next(iter(body_set))
 
-    # Walk from tail to head
     snake = [tail]
     visited = {tail}
 
@@ -59,31 +49,23 @@ def reconstruct_snake(body_positions, head):
         if not unvisited:
             break
 
-        # There should be exactly one unvisited neighbour at every step
-        # (two only at the tail, but we've already visited that direction).
         nxt = unvisited[0]
         snake.append(nxt)
         visited.add(nxt)
 
-    # Safety check: reconstructed chain must contain all body cells + head
+    # Check validity
     if len(snake) != len(body_positions) + 1:
         return None
-
-    # Ensure head is last (tail -> head order)
     if snake[-1] != head:
         snake.reverse()
         if snake[-1] != head:
             return None
 
-    return snake  # tail -> head
+    return snake
 
 
+# Get the next "ground truth" logical frame
 def get_next_logical_frame(state, action):
-    """
-    Returns next logical frame.
-    NOTE: Food channel is generated but should be IGNORED during comparison.
-    """
-
     H, W, C = state.shape
 
     if C != CHANNELS:
@@ -119,18 +101,13 @@ def get_next_logical_frame(state, action):
 
     new_head = (x, y)
 
-    # collision
-    if (
-            x < 0 or x >= W or
-            y < 0 or y >= H or
-            new_head in snake
-    ):
+    # Collision
+    if x < 0 or x >= W or y < 0 or y >= H or new_head in snake:
         return state.copy(), True
 
     snake.append(new_head)
 
     food_eaten = (new_head == food)
-
     if not food_eaten:
         snake.pop(0)
 
@@ -161,22 +138,8 @@ def get_next_logical_frame(state, action):
     return next_state, False
 
 
-# -------------------------
-# Unseen State  tion
-# -------------------------
+# Returns a procedurally generated Snake state of any length
 def generate_random_snake_state(grid_size=GRID_SIZE, min_length=1, max_length=8):
-    """
-    Procedurally generates a random, valid Snake state as a (3, H, W) numpy array.
-
-    Modified to favour straighter snakes:
-    - Bias towards continuing in the same direction
-    - Prevents rapid consecutive turns (turn cooldown)
-
-    Returns:
-        state  : np.ndarray (3, grid_size, grid_size)  float32
-        snake  : list of (row, col) tuples, tail-first, head last
-        food   : (row, col) tuple
-    """
     H = W = grid_size
     length = random.randint(min_length, max_length)
 
@@ -211,14 +174,14 @@ def generate_random_snake_state(grid_size=GRID_SIZE, min_length=1, max_length=8)
 
                 candidates.append((nr, nc))
 
-                # ---- Direction bias ----
+                # Direction bias
                 if (dr, dc) == prev_dir:
-                    weight = 5.0  # strongly prefer straight
+                    weight = 5.0  # Strongly prefer straight
                 else:
                     if turn_cooldown > 0:
-                        weight = 0.5  # discourage immediate turns
+                        weight = 0.5  # Discourage immediate turns
                     else:
-                        weight = 1.0  # allow occasional turns
+                        weight = 1.0  # Allow occasional turns
 
                 weights.append(weight)
 
@@ -234,7 +197,7 @@ def generate_random_snake_state(grid_size=GRID_SIZE, min_length=1, max_length=8)
             new_dir = (nxt[0] - hr, nxt[1] - hc)
 
             if new_dir != prev_dir:
-                turn_cooldown = 2  # enforce spacing between turns
+                turn_cooldown = 2  # For spacing between turns to avoid overcongestion
             else:
                 turn_cooldown = max(0, turn_cooldown - 1)
 
@@ -255,7 +218,7 @@ def generate_random_snake_state(grid_size=GRID_SIZE, min_length=1, max_length=8)
 
         food = random.choice(free_cells)
 
-        # Build state array (channels: 0=body, 1=head, 2=food)
+        # Build state array (channels: 0 = body, 1 = head, 2 = food)
         state = np.zeros((3, H, W), dtype=np.float32)
 
         for seg in snake[:-1]:
@@ -268,3 +231,77 @@ def generate_random_snake_state(grid_size=GRID_SIZE, min_length=1, max_length=8)
         return state, snake, food
 
     raise RuntimeError("Could not generate a valid random snake state after 1000 attempts.")
+
+
+def flatten_logits(logits):
+    # Helper to get shape compatibility between models
+    # U-Net: (B, 1, H, W) -> (B, N)
+    # Transformer/Baseline: (B, N) -> (B, N)
+    if logits.dim() == 4:
+        return logits.view(logits.size(0), -1)
+
+    return logits
+
+
+# Get the next "ground truth" logical frame
+def rules_based_next_state(state_np, action, grid_size=GRID_SIZE):
+    H = W = grid_size
+    body_map = (state_np[0] > 0.5)
+    head_map = (state_np[1] > 0.5)
+    food_map = (state_np[2] > 0.5)
+
+    head_pos = tuple(np.argwhere(head_map)[0])
+    food_pos = tuple(np.argwhere(food_map)[0])
+
+    hr, hc = head_pos
+    if action == UP:
+        hr -= 1
+    elif action == DOWN:
+        hr += 1
+    elif action == LEFT:
+        hc -= 1
+    elif action == RIGHT:
+        hc += 1
+    new_head = (hr, hc)
+
+    occupied = set(map(tuple, np.argwhere(head_map | body_map)))
+
+    if not (0 <= hr < H and 0 <= hc < W) or new_head in occupied:
+        return state_np.copy(), True
+
+    ate_food = (new_head == food_pos)
+
+    tail_pos = None
+    if not ate_food and body_map.any():
+        dist = {head_pos: 0}
+        queue = deque([head_pos])
+        while queue:
+            pos = queue.popleft()
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nb = (pos[0] + dr, pos[1] + dc)
+                if nb not in dist and nb in occupied:
+                    dist[nb] = dist[pos] + 1
+                    queue.append(nb)
+        tail_pos = max(dist, key=dist.get)
+
+    next_state = np.zeros((3, H, W), dtype=np.float32)
+    new_body = occupied.copy()
+    if tail_pos is not None:
+        new_body.discard(tail_pos)
+    new_body.discard(new_head)
+
+    for (r, c) in new_body:
+        next_state[0, r, c] = 1.0
+    next_state[1, new_head[0], new_head[1]] = 1.0
+
+    if ate_food:
+        all_occ = new_body | {new_head}
+        free = [(r2, c2) for r2 in range(H) for c2 in range(W)
+                if (r2, c2) not in all_occ]
+        if free:
+            fr, fc = random.choice(free)
+            next_state[2, fr, fc] = 1.0
+    else:
+        next_state[2, food_pos[0], food_pos[1]] = 1.0
+
+    return next_state, False
